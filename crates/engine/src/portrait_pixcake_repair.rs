@@ -225,18 +225,54 @@ pub(crate) fn build_pf90080_oil_shine_output(
         region[p] = skin_mask[p] as f32 / 255.0 * focus[p];
     }
 
-    // Local + global diffuse skin baseline. Scale the box radius to the frame so
-    // wider specular patches on the forehead or nose bridge do not dominate their
-    // own baseline.
-    let base_radius = (width.min(height) / 5).clamp(10, 48);
+    // Two-scale diffuse skin baseline: combine local wide skin-weighted blur
+    // with the global diffuse skin mean so wide forehead specular patches never
+    // dominate their own baseline and leave a chalky white center island.
+    let base_radius = (width.min(height) / 5).clamp(10, 64);
     let base_r = weighted_blur(&source_r, &region, width, height, base_radius);
     let base_g = weighted_blur(&source_g, &region, width, height, base_radius);
     let base_b = weighted_blur(&source_b, &region, width, height, base_radius);
 
+    let mut global_w = 0.0f64;
+    let mut global_luma = 0.0f64;
+    let mut global_r = 0.0f64;
+    let mut global_g = 0.0f64;
+    let mut global_b = 0.0f64;
+    for p in 0..pixels {
+        let w = region[p] as f64;
+        if w <= 1e-4 {
+            continue;
+        }
+        let max_c = source_r[p].max(source_g[p]).max(source_b[p]);
+        let min_c = source_r[p].min(source_g[p]).min(source_b[p]);
+        let sat = if max_c > 1.0 { (max_c - min_c) / max_c } else { 0.0 };
+        // Down-weight bright desaturated pixels when estimating global diffuse skin.
+        let diffuse_bias = (0.35 + sat as f64) * (1.0 - smoothstep(205.0, 248.0, luma[p]) as f64 * 0.85);
+        let gw = w * diffuse_bias;
+        global_w += gw;
+        global_luma += gw * luma[p] as f64;
+        global_r += gw * source_r[p] as f64;
+        global_g += gw * source_g[p] as f64;
+        global_b += gw * source_b[p] as f64;
+    }
+    let (mean_luma, mean_r, mean_g, mean_b) = if global_w > 1e-4 {
+        (
+            (global_luma / global_w) as f32,
+            (global_r / global_w) as f32,
+            (global_g / global_w) as f32,
+            (global_b / global_w) as f32,
+        )
+    } else {
+        (160.0, 175.0, 145.0, 125.0)
+    };
+
     let mut oil = vec![0.0f32; pixels];
     for p in 0..pixels {
-        let baseline = 0.299 * base_r[p] + 0.587 * base_g[p] + 0.114 * base_b[p];
-        let excess = luma[p] - baseline;
+        let local_baseline = 0.299 * base_r[p] + 0.587 * base_g[p] + 0.114 * base_b[p];
+        // Blend local baseline with global diffuse skin so the interior of a wide
+        // forehead shine still registers positive excess.
+        let baseline = local_baseline.min(local_baseline * 0.55 + mean_luma * 0.45);
+        let excess = (luma[p] - baseline).max(0.0);
         let maximum = source_r[p].max(source_g[p]).max(source_b[p]);
         let minimum = source_r[p].min(source_g[p]).min(source_b[p]);
         let saturation = if maximum > 1.0 {
@@ -244,50 +280,51 @@ pub(crate) fn build_pf90080_oil_shine_output(
         } else {
             0.0
         };
-        // Specular oil lifts luma and washes out chroma. A coloured skin pixel
-        // with the same luma excess gets a smaller response.
+        // Specular oil lifts luma and washes out chroma.
         let strength = excess * (1.0 - saturation.clamp(0.0, 1.0));
-        oil[p] = smoothstep(5.0, 26.0, strength) * region[p];
+        oil[p] = smoothstep(8.0, 32.0, strength) * region[p];
     }
 
     let ones = vec![1.0f32; pixels];
-    let feathered = weighted_blur(&oil, &ones, width, height, 1);
+    let feather_r = (base_radius / 5).clamp(2, 10);
+    let feathered = weighted_blur(
+        &weighted_blur(&oil, &ones, width, height, feather_r),
+        &ones,
+        width,
+        height,
+        feather_r,
+    );
     let mask: Vec<u8> = feathered
         .iter()
         .zip(skin_mask)
         .map(|(&weight, &skin)| clamp_byte(weight * (skin as f32 / 255.0) * 255.0))
         .collect();
 
-    // Estimate the matte diffuse target from surrounding non-specular skin pixels,
-    // then put back a fraction of the clean skin texture.
+    // Estimate the warm matte diffuse target from surrounding non-specular skin,
+    // blending gently toward the global diffuse skin tone where wide highlights
+    // cover the local window, and preserve original fine skin pore micro-texture.
     let diffuse_weight: Vec<f32> = region
         .iter()
         .zip(&oil)
-        .map(|(&r, &o)| r * (1.0 - o * 0.95).max(0.01))
+        .map(|(&r, &o)| r * (1.0 - o * 0.96).max(0.01))
         .collect();
     let matte_r = weighted_blur(&source_r, &diffuse_weight, width, height, base_radius);
     let matte_g = weighted_blur(&source_g, &diffuse_weight, width, height, base_radius);
     let matte_b = weighted_blur(&source_b, &diffuse_weight, width, height, base_radius);
-    let mut clean_r = vec![0.0f32; pixels];
-    let mut clean_g = vec![0.0f32; pixels];
-    let mut clean_b = vec![0.0f32; pixels];
-    for p in 0..pixels {
-        let weight = feathered[p] * region[p];
-        clean_r[p] = source_r[p] + weight * (matte_r[p] - source_r[p]);
-        clean_g[p] = source_g[p] + weight * (matte_g[p] - source_g[p]);
-        clean_b[p] = source_b[p] + weight * (matte_b[p] - source_b[p]);
-    }
-    let clean_luma: Vec<f32> = (0..pixels)
-        .map(|p| 0.299 * clean_r[p] + 0.587 * clean_g[p] + 0.114 * clean_b[p])
-        .collect();
-    let smooth_luma = weighted_blur(&clean_luma, &region, width, height, 3);
+    let pore_r = (width.min(height) / 300).clamp(1, 3);
+    let smooth_src_luma = weighted_blur(&luma, &region, width, height, pore_r);
 
     let mut effect_rgb = vec![0u8; pixels * 3];
     for p in 0..pixels {
-        let high_frequency = (clean_luma[p] - smooth_luma[p]) * 0.35;
-        effect_rgb[p * 3] = clamp_byte(matte_r[p] + high_frequency);
-        effect_rgb[p * 3 + 1] = clamp_byte(matte_g[p] + high_frequency);
-        effect_rgb[p * 3 + 2] = clamp_byte(matte_b[p] + high_frequency);
+        // Pull washed-out local matte slightly toward warm diffuse skin mean inside strong highlights.
+        let anchor = (feathered[p] * 0.35).clamp(0.0, 0.35);
+        let tr = matte_r[p] * (1.0 - anchor) + mean_r * anchor;
+        let tg = matte_g[p] * (1.0 - anchor) + mean_g * anchor;
+        let tb = matte_b[p] * (1.0 - anchor) + mean_b * anchor;
+        let pore_detail = ((luma[p] - smooth_src_luma[p]) * 0.55).clamp(-12.0, 12.0);
+        effect_rgb[p * 3] = clamp_byte(tr + pore_detail);
+        effect_rgb[p * 3 + 1] = clamp_byte(tg + pore_detail);
+        effect_rgb[p * 3 + 2] = clamp_byte(tb + pore_detail);
     }
 
     Ok(RepairOutput::OilShine { effect_rgb, mask })

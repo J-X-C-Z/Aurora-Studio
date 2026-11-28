@@ -406,8 +406,14 @@ pub(crate) fn build_pf5_dark_circle_output(
     skin_mask: Option<&[u8]>,
     eye_mask: Option<&[u8]>,
 ) -> Result<RepairOutput, Refusal> {
-    let radius = 2usize;
-    let context = prepare(frame, face_points194, skin_mask, eye_mask, radius)?;
+    let base_context = prepare(frame, face_points194, skin_mask, eye_mask, 2)?;
+    let avg_eye_h = (base_context.left.height + base_context.right.height) * 0.5;
+    let radius = ((avg_eye_h * 0.35).round() as usize).clamp(2, 14);
+    let context = if radius == 2 {
+        base_context
+    } else {
+        prepare(frame, face_points194, skin_mask, eye_mask, radius)?
+    };
     let width = frame.width as usize;
     let pixels = frame.pixel_count();
     let mut residual = vec![PF5_RESIDUAL_BIAS; pixels * 3];
@@ -474,8 +480,8 @@ pub(crate) fn build_pf5_dark_circle_output(
             // texture) is left untouched. Negative per-channel deltas remove
             // cyan/purple casts; the clamp prevents an over-bleached patch.
             for channel in 0..3 {
-                let delta = ((reference[channel] - low[channel]) * 0.9)
-                    .clamp(-16.0, 40.0)
+                let delta = ((reference[channel] - low[channel]) * 0.65)
+                    .clamp(-12.0, 26.0)
                     * weight;
                 residual[index * 3 + channel] = PF5_RESIDUAL_BIAS + delta;
             }
@@ -506,8 +512,14 @@ pub(crate) fn build_pf90116_eye_bag_planes(
     skin_mask: Option<&[u8]>,
     eye_mask: Option<&[u8]>,
 ) -> Result<AlignedEyeBagPlanes, Refusal> {
-    let radius = 2usize;
-    let context = prepare(frame, face_points194, skin_mask, eye_mask, radius)?;
+    let base_context = prepare(frame, face_points194, skin_mask, eye_mask, 2)?;
+    let avg_eye_h = (base_context.left.height + base_context.right.height) * 0.5;
+    let radius = ((avg_eye_h * 0.35).round() as usize).clamp(2, 14);
+    let context = if radius == 2 {
+        base_context
+    } else {
+        prepare(frame, face_points194, skin_mask, eye_mask, radius)?
+    };
     let width = frame.width as usize;
     let pixels = frame.pixel_count();
     let mut repair = vec![0.0f32; pixels * 3];
@@ -550,14 +562,14 @@ pub(crate) fn build_pf90116_eye_bag_planes(
             // cheek reference. The high-frequency residual `source - low`
             // survives unchanged, so pores and the natural silkworm edge stay.
             for channel in 0..3 {
-                let delta = (reference[channel] - low[channel]).clamp(-32.0, 32.0);
+                let delta = ((reference[channel] - low[channel]) * 0.72).clamp(-24.0, 24.0);
                 repair[index * 3 + channel] = (repair[index * 3 + channel] + delta)
                     .clamp(0.0, 255.0);
             }
             // The kernel quantizes this to bytes and multiplies by degree.
             // A near-full response in the core gives the flattened low-frequency
             // field real weight while the feather still protects the boundary.
-            response[index] = (weight * 1.4).clamp(0.0, 1.0);
+            response[index] = (weight * 1.15).clamp(0.0, 1.0);
         }
     }
 

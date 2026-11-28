@@ -1120,6 +1120,11 @@ fn derive_owner_mask_with_uvs(
 
     if pf == 107 && material_mask.is_none() {
         feather_inward_mask(&mut rgba, w, h, 2);
+    } else if matches!(pf, 8 | 9 | 106 | 116) && w >= 16 && h >= 16 {
+        // Gently feather whole-face blusher/contour masks so side-profile
+        // triangle boundaries transition smoothly without hard polygonal seams.
+        let passes = ((w.min(h) / 160).clamp(1, 3)) as usize;
+        feather_inward_mask(&mut rgba, w, h, passes);
     }
 
     // Clip every owner mask against the same-job FaceMask so side-profile

@@ -356,10 +356,11 @@ pub(crate) fn build_pf30259_sweat_output(
                 }
             }
             let rim_gain = 0.6 + 0.4 * smoothstep(0.0, 16.0, rim);
-            core[p] = smoothstep(4.0, 18.0, strength) * rim_gain * region[p];
+            core[p] = smoothstep(8.0, 24.0, strength) * rim_gain * region[p];
         }
     }
-    let feathered = weighted_blur(&core, &ones, width, height, 1);
+    let feather_r = (radius / 4).clamp(1, 5);
+    let feathered = weighted_blur(&core, &ones, width, height, feather_r);
 
     let mut pixels_out = frame.pixels.clone();
     for p in 0..pixels {
@@ -367,9 +368,11 @@ pub(crate) fn build_pf30259_sweat_output(
         if weight <= 0.0 {
             continue;
         }
+        let pore_detail = ((source_luma[p] - local_luma[p]) * 0.45).clamp(-10.0, 10.0);
         for channel in 0..3 {
+            let target = (base[channel][p] + pore_detail).clamp(0.0, 255.0);
             pixels_out[p * 4 + channel] = clamp_byte(
-                source[channel][p] + weight * (base[channel][p] - source[channel][p]),
+                source[channel][p] + weight * (target - source[channel][p]),
             );
         }
     }

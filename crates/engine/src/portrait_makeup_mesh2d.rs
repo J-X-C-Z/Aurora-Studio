@@ -359,6 +359,52 @@ fn push_face_template_mesh(
         face_uvs.push(FACE_TEMPLATE_149_UV[i]);
     }
 
+    // Prevent steep-yaw far-cheek silhouette landmarks (109..=113 on the left,
+    // 137..=141 on the right) from folding inward past the outer eye corner
+    // (18/25 or 36/43), which otherwise causes backface culling to drop
+    // cheek-contour triangles ([18,111,110], [109,18,110], etc.) and punch a
+    // sharp triangular notch under the outer eye corner. Any slight outward
+    // margin is clipped cleanly to the real face silhouette by FaceMask.
+    let face_axis = [
+        face_pts[141][0] - face_pts[109][0],
+        face_pts[141][1] - face_pts[109][1],
+    ];
+    let axis_len = face_axis[0].hypot(face_axis[1]);
+    if axis_len > 8.0 {
+        let fx = [face_axis[0] / axis_len, face_axis[1] / axis_len];
+        let origin = face_pts[56];
+        let proj = |p: [f32; 2]| (p[0] - origin[0]) * fx[0] + (p[1] - origin[1]) * fx[1];
+        let margin = (axis_len * 0.015).clamp(2.0, 6.0);
+        let left_limit = proj(face_pts[18])
+            .min(proj(face_pts[25]))
+            .min(proj(face_pts[0]))
+            - margin;
+        for idx in 109..=113 {
+            let p_val = proj(face_pts[idx]);
+            if p_val > left_limit {
+                let shift = p_val - left_limit;
+                face_pts[idx] = [
+                    (face_pts[idx][0] - shift * fx[0]).clamp(0.0, fw),
+                    (face_pts[idx][1] - shift * fx[1]).clamp(0.0, fh),
+                ];
+            }
+        }
+        let right_limit = proj(face_pts[36])
+            .max(proj(face_pts[43]))
+            .max(proj(face_pts[9]))
+            + margin;
+        for idx in 137..=141 {
+            let p_val = proj(face_pts[idx]);
+            if p_val < right_limit {
+                let shift = right_limit - p_val;
+                face_pts[idx] = [
+                    (face_pts[idx][0] + shift * fx[0]).clamp(0.0, fw),
+                    (face_pts[idx][1] + shift * fx[1]).clamp(0.0, fh),
+                ];
+            }
+        }
+    }
+
     let eye_mid = midpoint(points194[22], points194[40]);
     let up = [eye_mid[0] - points194[125][0], eye_mid[1] - points194[125][1]];
     let brow_c = midpoint(points194[4], points194[13]);
@@ -1252,6 +1298,32 @@ mod tests {
             (u56 - FACE_TEMPLATE_149_UV[56][0]).abs() < 1e-5,
             "nose bridge UV drifted under 55-deg yaw: {u56}"
         );
+    }
+
+    #[test]
+    fn steep_yaw_far_cheek_outer_eye_triangles_never_tear() {
+        for yaw in [-50.0f32, -35.0, 35.0, 50.0] {
+            let points = posed_real_face194(yaw, 0.0, [1000, 1000]);
+            let mesh = region_mesh(&points, [1000, 1000], &row_profile(106).unwrap()).unwrap();
+            let tris: Vec<[u16; 3]> = mesh
+                .indices
+                .chunks_exact(3)
+                .map(|c| [c[0], c[1], c[2]])
+                .collect();
+            for required in [
+                [18u16, 111, 110],
+                [109, 18, 110],
+                [18, 25, 111],
+                [139, 36, 140],
+                [36, 141, 140],
+                [43, 36, 139],
+            ] {
+                assert!(
+                    tris.contains(&required),
+                    "yaw={yaw}: missing cheek-contour triangle {required:?} (would punch triangular notch)"
+                );
+            }
+        }
     }
 
     #[test]

@@ -8152,50 +8152,162 @@ fn apply_cpu_effect(
     }
 }
 
-/// PF0 Spotless: vendor-proven blur-difference fragment with the frame's own
-/// SkinMask/FaceMask. The vendor blur FBO producer is still LIVE_ONLY, so this
-/// wiring uses a local separable box blur as a stand-in and makes NO parity claim.
+/// PF0 Spotless: skin-masked, frequency-separated blemish healing.
+///
+/// Uses a skin+face weighted separable blur so hair, eyebrows, eyes, and
+/// background never bleed into the skin baseline, a continuous `smoothstep`
+/// blemish detector (no hard binary cliff that turns forehead shading into
+/// chalky islands), and high-frequency pore retention so healed skin stays
+/// natural and textured.
 fn apply_pf0_spotless(
     current: &Image,
     degree: f32,
     skin_mask: Option<&[u8]>,
     face_mask: Option<&[u8]>,
 ) -> Result<Image, Refusal> {
-    use aurora_portrait::kernels::spotless::{self, ImageF32, SpotlessParams};
     let skin = required(skin_mask, "PF0 skin mask")?;
     let face = required(face_mask, "PF0 face mask")?;
     let pixels = current.pixel_count();
     check_plane(skin.len(), pixels, "PF0 skin mask")?;
     check_plane(face.len(), pixels, "PF0 face mask")?;
+    let degree = degree.clamp(0.0, 1.0);
     if degree <= 0.0 {
         return Ok(current.clone());
     }
-    let params = SpotlessParams {
-        dist_factor: 28.87,
-        dist_threshold: 0.5,
-        dark_diff_min_threshold: 0.0,
-        dark_diff_max_threshold: 0.3,
-        white_diff_factor: 0.7,
-        degree: degree.clamp(0.0, 1.0),
+
+    let w = current.width as usize;
+    let h = current.height as usize;
+    if w == 0 || h == 0 {
+        return Ok(current.clone());
+    }
+
+    let mut sr = vec![0.0f32; pixels];
+    let mut sg = vec![0.0f32; pixels];
+    let mut sb = vec![0.0f32; pixels];
+    let mut luma = vec![0.0f32; pixels];
+    let mut weight = vec![0.0f32; pixels];
+    for p in 0..pixels {
+        let off = p * 4;
+        let r = f32::from(current.pixels[off]);
+        let g = f32::from(current.pixels[off + 1]);
+        let b = f32::from(current.pixels[off + 2]);
+        sr[p] = r;
+        sg[p] = g;
+        sb[p] = b;
+        luma[p] = 0.299 * r + 0.587 * g + 0.114 * b;
+        weight[p] = (f32::from(skin[p]) / 255.0) * (f32::from(face[p]) / 255.0);
+    }
+
+    let smoothstep = |e0: f32, e1: f32, x: f32| -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
     };
-    let src: Vec<f32> = current.pixels.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let blur_rgb = box_blur_rgba(current, 8);
-    let face_f: Vec<f32> = face.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let skin_f: Vec<f32> = skin.iter().map(|v| f32::from(*v) / 255.0).collect();
-    let mut out = vec![0.0f32; src.len()];
-    spotless::apply(
-        ImageF32 { width: current.width, height: current.height, pixels: &src },
-        ImageF32 { width: current.width, height: current.height, pixels: &blur_rgb },
-        &face_f,
-        Some(&skin_f),
-        params,
-        &mut out,
-    )?;
-    let mut image = current.clone();
-    for (dst, pixel) in image.pixels.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
-        for channel in 0..4 {
-            dst[channel] = (pixel[channel].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+
+    let weighted_box = |vals: &[f32], wt: &[f32], radius: usize| -> Vec<f32> {
+        if radius == 0 {
+            return vals.to_vec();
         }
+        let mut horiz = vec![0.0f32; pixels];
+        let mut pv = Vec::with_capacity(w + 1);
+        let mut pw = Vec::with_capacity(w + 1);
+        for y in 0..h {
+            let row = y * w;
+            pv.clear();
+            pw.clear();
+            pv.push(0.0f32);
+            pw.push(0.0f32);
+            for x in 0..w {
+                let i = row + x;
+                pv.push(pv[x] + vals[i] * wt[i]);
+                pw.push(pw[x] + wt[i]);
+            }
+            for x in 0..w {
+                let lo = x.saturating_sub(radius);
+                let hi = (x + radius + 1).min(w);
+                let sw = pw[hi] - pw[lo];
+                horiz[row + x] = if sw > 1e-6 {
+                    (pv[hi] - pv[lo]) / sw
+                } else {
+                    vals[row + x]
+                };
+            }
+        }
+        let mut out = vec![0.0f32; pixels];
+        pv.resize(h + 1, 0.0);
+        pw.resize(h + 1, 0.0);
+        for x in 0..w {
+            pv[0] = 0.0;
+            pw[0] = 0.0;
+            for y in 0..h {
+                let i = y * w + x;
+                pv[y + 1] = pv[y] + horiz[i] * wt[i];
+                pw[y + 1] = pw[y] + wt[i];
+            }
+            for y in 0..h {
+                let lo = y.saturating_sub(radius);
+                let hi = (y + radius + 1).min(h);
+                let sw = pw[hi] - pw[lo];
+                out[y * w + x] = if sw > 1e-6 {
+                    (pv[hi] - pv[lo]) / sw
+                } else {
+                    horiz[y * w + x]
+                };
+            }
+        }
+        out
+    };
+
+    let spot_r = (w.min(h) / 140).clamp(4, 14);
+    let pore_r = (spot_r / 3).clamp(1, 3);
+    // Two-pass skin-masked blur approximates Gaussian without bleeding hair/brows.
+    let br = weighted_box(&weighted_box(&sr, &weight, spot_r), &weight, spot_r);
+    let bg = weighted_box(&weighted_box(&sg, &weight, spot_r), &weight, spot_r);
+    let bb = weighted_box(&weighted_box(&sb, &weight, spot_r), &weight, spot_r);
+    let fine_luma = weighted_box(&luma, &weight, pore_r);
+
+    // Continuous localized blemish mask: dark spots, red acne bumps, and small
+    // localized bright whiteheads — never triggering on broad smooth shading.
+    let mut blemish = vec![0.0f32; pixels];
+    for p in 0..pixels {
+        let wt = weight[p];
+        if wt <= 1e-4 {
+            continue;
+        }
+        let bluma = 0.299 * br[p] + 0.587 * bg[p] + 0.114 * bb[p];
+        let dark_excess = (bluma - luma[p]).max(0.0);
+        let red_excess = ((sr[p] - sg[p]) - (br[p] - bg[p])).max(0.0);
+        let light_excess = (luma[p] - bluma).max(0.0);
+
+        let dark_score = smoothstep(5.0, 22.0, dark_excess);
+        let acne_score = smoothstep(4.0, 16.0, red_excess);
+        // Only suppress compact bright blemishes (high local contrast vs fine_luma),
+        // leaving broad forehead/cheek highlights smooth and natural.
+        let local_peak = (luma[p] - fine_luma[p]).max(0.0);
+        let bright_score = smoothstep(7.0, 26.0, light_excess) * smoothstep(2.0, 10.0, local_peak);
+
+        blemish[p] = dark_score.max(acne_score).max(bright_score * 0.75) * wt;
+    }
+
+    // Soften the blemish mask so healed spots feather invisibly into surrounding skin.
+    let ones = vec![1.0f32; pixels];
+    let feather_r = (spot_r / 3).clamp(1, 4);
+    let blemish = weighted_box(&blemish, &ones, feather_r);
+
+    let mut image = current.clone();
+    for p in 0..pixels {
+        let alpha = (blemish[p] * degree).clamp(0.0, 1.0);
+        if alpha <= 1e-4 {
+            continue;
+        }
+        // Keep 60% of natural fine micro-pore texture while healing low-frequency blemish color.
+        let pore_detail = ((luma[p] - fine_luma[p]) * 0.60).clamp(-12.0, 12.0);
+        let target_r = (br[p] + pore_detail).clamp(0.0, 255.0);
+        let target_g = (bg[p] + pore_detail).clamp(0.0, 255.0);
+        let target_b = (bb[p] + pore_detail).clamp(0.0, 255.0);
+        let off = p * 4;
+        image.pixels[off] = (sr[p] + alpha * (target_r - sr[p])).round().clamp(0.0, 255.0) as u8;
+        image.pixels[off + 1] = (sg[p] + alpha * (target_g - sg[p])).round().clamp(0.0, 255.0) as u8;
+        image.pixels[off + 2] = (sb[p] + alpha * (target_b - sb[p])).round().clamp(0.0, 255.0) as u8;
     }
     Ok(image)
 }
