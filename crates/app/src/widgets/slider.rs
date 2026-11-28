@@ -7,6 +7,11 @@
 //!   it, Esc leaves it unchanged.
 //! * Ctrl+scroll over the slider nudges by one step (Shift: ten steps); plain
 //!   scrolling keeps scrolling the inspector.
+//! * A sideways two-finger trackpad scroll over the slider adjusts it finely
+//!   (Alt: ten times finer); a gesture that starts vertical scrolls the
+//!   inspector instead. It stops briefly on the default.
+//! * Dragging snaps onto the default when close to it. Reaching the default
+//!   either way is felt on a Force Touch trackpad.
 //! * The knob glides when the value changes from elsewhere (reset, auto, undo),
 //!   and stays pinned to the pointer while dragging.
 
@@ -89,6 +94,15 @@ struct SliderState {
     pending: Option<f32>,
     input: Option<Entity<InputState>>,
     _input_sub: Option<gpui_kit::Subscription>,
+    /// The trackpad gesture over this slider.
+    scroll: crate::gesture::Gesture,
+    /// Value before and during that gesture, so fast events don't read a stale render.
+    scroll_start: Option<f32>,
+    scroll_value: Option<f32>,
+    /// Travel, in pixels, still to absorb at the default before moving on.
+    detent: f32,
+    /// Momentum from a sideways gesture is swallowed until then.
+    coast_until: Option<std::time::Instant>,
 }
 
 /// Reads a typed number, tolerating a unit, a leading plus and a decimal comma.
@@ -162,6 +176,90 @@ pub struct ParamSlider {
     flag: Option<SharedString>,
     on_change: Option<OnChange>,
     on_commit: Option<OnCommit>,
+}
+
+/// How close to the default, as a fraction of the track, a drag snaps onto it.
+const SNAP_T: f32 = 0.012;
+/// Trackpad travel across the whole range, in pixels.
+const TRACKPAD_SPAN_PX: f32 = 1000.0;
+/// Trackpad travel the default holds on to when the value reaches it.
+const DETENT_PX: f32 = 10.0;
+
+/// A trackpad scroll over a slider: sideways gestures adjust the value; one
+/// that starts vertical is left for the inspector to scroll.
+#[allow(clippy::too_many_arguments)]
+fn trackpad_adjust(
+    st: &Entity<SliderState>,
+    phase: gpui_kit::TouchPhase,
+    d: (f32, f32),
+    fine: f32,
+    (value, default, min, max, scale): (f32, f32, f32, f32, Scale),
+    on_change: &Option<OnChange>,
+    on_commit: &Option<OnCommit>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::gesture::{Axis, Part};
+    use std::time::{Duration, Instant};
+    let part = st.update(cx, |s, _| s.scroll.feed(phase, d));
+    let sideways = st.read(cx).scroll.axis() == Some(Axis::X);
+    match part {
+        Part::Begin => st.update(cx, |s, _| {
+            s.scroll_start = Some(value);
+            s.scroll_value = Some(value);
+            s.detent = 0.0;
+        }),
+        Part::Move if sideways => {
+            cx.stop_propagation();
+            let (current, held) = st.update(cx, |s, _| {
+                let held = s.detent.min(d.0.abs());
+                s.detent -= held;
+                (s.scroll_value.unwrap_or(value), held)
+            });
+            let dx = d.0.signum() * (d.0.abs() - held);
+            if dx == 0.0 {
+                return;
+            }
+            let mut next = scale.to_value(scale.to_t(current, min, max) + dx / TRACKPAD_SPAN_PX / fine, min, max);
+            if current != default && crate::gesture::crossed(current, next, default) {
+                next = default;
+                st.update(cx, |s, _| s.detent = DETENT_PX);
+                crate::haptics::play(crate::haptics::Haptic::Alignment);
+            }
+            if (next - current).abs() > 1e-7 {
+                st.update(cx, |s, _| s.scroll_value = Some(next));
+                if let Some(f) = on_change {
+                    f(next, window, cx);
+                }
+            }
+        }
+        Part::Move => {}
+        Part::End | Part::Cancel => {
+            let (start, last) = st.update(cx, |s, _| (s.scroll_start.take(), s.scroll_value.take()));
+            if !sideways {
+                return;
+            }
+            cx.stop_propagation();
+            st.update(cx, |s, _| s.coast_until = Some(Instant::now() + Duration::from_millis(1200)));
+            let changed = start.zip(last).is_some_and(|(a, b)| (a - b).abs() > 1e-7);
+            if !changed {
+                return;
+            }
+            if part == Part::Cancel {
+                // The system took the gesture: put the value back, record nothing.
+                if let (Some(f), Some(start)) = (on_change, start) {
+                    f(start, window, cx);
+                }
+            } else if let Some(f) = on_commit {
+                f(window, cx);
+            }
+        }
+        Part::Coast => {
+            if st.read(cx).coast_until.is_some_and(|t| Instant::now() < t) {
+                cx.stop_propagation();
+            }
+        }
+    }
 }
 
 impl ParamSlider {
@@ -340,9 +438,15 @@ impl RenderOnce for ParamSlider {
             move |x: Pixels, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
                 let w = f32::from(bounds.size.width).max(1.0);
                 let t = (f32::from(x - bounds.origin.x) / w).clamp(0.0, 1.0);
-                let next = scale.to_value(t, min, max);
+                let mut next = scale.to_value(t, min, max);
+                if (t - scale.to_t(default, min, max)).abs() < SNAP_T {
+                    next = default;
+                }
                 if (next - current_val).abs() < 1e-6 {
                     return;
+                }
+                if next == default {
+                    crate::haptics::play(crate::haptics::Haptic::Alignment);
                 }
                 if let Some(f) = &on_change {
                     f(next, window, cx);
@@ -587,8 +691,14 @@ impl RenderOnce for ParamSlider {
                 this.on_scroll({
                     let on_change = on_change.clone();
                     let on_commit = on_commit.clone();
+                    let st = st.clone();
                     move |e: &ScrollEvent, window, cx| {
                         if !e.modifiers.control {
+                            if let ScrollDelta::Pixels(d) = e.delta {
+                                let d = (f32::from(d.x), f32::from(d.y));
+                                let fine = if e.modifiers.alt { 10.0 } else { 1.0 };
+                                trackpad_adjust(&st, e.touch_phase, d, fine, (value, default, min, max, scale), &on_change, &on_commit, window, cx);
+                            }
                             return;
                         }
                         let dy = match e.delta {

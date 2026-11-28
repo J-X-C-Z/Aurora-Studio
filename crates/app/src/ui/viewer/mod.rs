@@ -128,6 +128,10 @@ pub struct Viewer {
     last_frame: u64,
     /// The last Speed Edit parameter, kept while its readout fades out.
     speed_shown: Option<SpeedParam>,
+    /// Two-finger swipe across a fitted image.
+    swipe: crate::gesture::Swipe,
+    /// This trackpad pan has already bumped into the image edge.
+    pan_edge: bool,
     _sub: Subscription,
 }
 
@@ -142,6 +146,8 @@ impl Viewer {
             loupe_down: false,
             last_frame: 0,
             speed_shown: None,
+            swipe: crate::gesture::Swipe::default(),
+            pan_edge: false,
             _sub: cx.observe(state, |_, _, cx| cx.notify()),
         }
     }
@@ -504,19 +510,72 @@ impl Viewer {
     }
 
     /// Scales the view by `factor`, keeping frame point `f` where it is on
-    /// screen; at or below the fitted size the view goes back to fit.
+    /// screen; at or below the fitted size the view goes back to fit. Settling
+    /// into fit or passing 100% is felt on a Force Touch trackpad.
     fn zoom_about(&mut self, f: (f32, f32), factor: f32, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, cx| {
+        let stop = self.state.update(cx, |s, cx| {
             let current = s.effective_scale();
             let next = current * factor;
+            let was_zoomed = s.preview_state.zoom.scale.is_some();
             if next <= s.fit_scale() {
-                s.set_zoom(None, None, cx)
+                s.set_zoom(None, None, cx);
+                was_zoomed
             } else {
                 let k = current / next;
-                let c = if s.preview_state.zoom.scale.is_none() { (0.5, 0.5) } else { s.preview_state.zoom.center };
-                s.set_zoom(Some(next), Some((f.0 + (c.0 - f.0) * k, f.1 + (c.1 - f.1) * k)), cx)
+                let c = if was_zoomed { s.preview_state.zoom.center } else { (0.5, 0.5) };
+                s.set_zoom(Some(next), Some((f.0 + (c.0 - f.0) * k, f.1 + (c.1 - f.1) * k)), cx);
+                // One device pixel per image pixel.
+                crate::gesture::crossed(current, next, s.device.scale_factor)
             }
         });
+        if stop {
+            crate::haptics::play(crate::haptics::Haptic::LevelChange);
+        }
+    }
+
+    /// A trackpad scroll without ⌘/Ctrl: pans a zoomed view, or pages
+    /// through images with a sideways swipe while the view is fitted.
+    fn on_trackpad(&mut self, phase: gpui_kit::TouchPhase, d: (f32, f32), cx: &mut Context<Self>) {
+        use crate::gesture::SwipeAction;
+        use crate::haptics::{Haptic, play};
+        let pl = self.placement;
+        if self.state.read(cx).preview_state.zoom.scale.is_some() {
+            self.swipe = crate::gesture::Swipe::default();
+            if phase == gpui_kit::TouchPhase::Started {
+                self.pan_edge = false;
+            }
+            let (dx, dy) = (-d.0 / (pl.fw * pl.s), -d.1 / (pl.fh * pl.s));
+            let edge = self.state.update(cx, |s, cx| {
+                let before = s.preview_state.zoom.center;
+                let region = s.visible_region();
+                s.pan_by(dx, dy, cx);
+                let after = s.preview_state.zoom.center;
+                // Only an axis the image overflows can hit an edge.
+                let stopped = |want: f32, got: f32, room: bool| room && want.abs() > 1e-5 && (want - got).abs() > want.abs() * 0.5;
+                stopped(dx, after.0 - before.0, region.width < 1.0) || stopped(dy, after.1 - before.1, region.height < 1.0)
+            });
+            if edge && !self.pan_edge {
+                play(Haptic::Generic);
+                self.pan_edge = true;
+            }
+            return;
+        }
+        match self.swipe.feed(phase, d, pl.vw) {
+            SwipeAction::Armed => play(Haptic::Alignment),
+            SwipeAction::Go(n) => {
+                let moved = self.state.update(cx, |s, cx| {
+                    let before = s.library.current;
+                    s.step(n, cx);
+                    s.library.current != before
+                });
+                if !moved {
+                    // Already at the first or last image.
+                    play(Haptic::Generic);
+                }
+            }
+            SwipeAction::None | SwipeAction::Disarmed => {}
+        }
+        cx.notify();
     }
 
     /// Two fingers on a touch screen, or a trackpad pinch.
@@ -535,6 +594,12 @@ impl Viewer {
             };
             let steps = if e.modifiers.shift { steps / 4.0 } else { steps };
             self.state.update(cx, |s, cx| s.speed_nudge(steps, cx));
+            return;
+        }
+        if let ScrollDelta::Pixels(d) = e.delta
+            && !(e.modifiers.control || e.modifiers.platform)
+        {
+            self.on_trackpad(e.touch_phase, (f32::from(d.x), f32::from(d.y)), cx);
             return;
         }
         let delta = match e.delta {
@@ -676,8 +741,15 @@ impl Render for Viewer {
         };
         let warn_t = motion::toggle(motion::key("viewer", "warn"), warn_on, motion::GLIDE, window, cx);
         let focus_t = motion::toggle(motion::key("viewer", "focus"), focus_on, motion::GLIDE, window, cx);
+        // A sideways trackpad swipe drags the fitted image along, damped, and
+        // springs it back when let go short. Keyed per image, so the next
+        // image starts centred.
+        let swipe_dx = motion::follow(motion::key(format!("viewer-{image_key}"), "swipe"), self.swipe.offset() * 0.6, motion::QUICK, self.swipe.offset() == 0.0, window, cx);
         let s = self.state.read(cx);
         self.placement = Placement { vw: s.preview_state.viewport.0, vh: s.preview_state.viewport.1, s: anim_s, cx: anim_cx, cy: anim_cy, fw, fh };
+        if swipe_dx.abs() > 0.01 {
+            self.placement.cx -= swipe_dx / (fw * anim_s).max(1e-3);
+        }
         let pl = self.placement;
 
         let frame_el = |frame: &crate::state::Frame| {

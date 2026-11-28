@@ -6,6 +6,8 @@ mod contract;
 mod diagnostics;
 pub use diagnostics::init as init_diagnostics;
 mod evidence;
+mod gesture;
+mod haptics;
 mod i18n;
 mod motion;
 mod perf;
