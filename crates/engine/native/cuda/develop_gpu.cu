@@ -796,16 +796,10 @@ static __device__ __forceinline__ float band_weight(
     } else {
         sat_w = 1.0f;
     }
-    float vv = clampf(v, 0.0f, 1.0f);
-    float value_w;
-    if (vv < b[7]) {
-        value_w = sstep(b[7] - 0.05f, b[7], vv);
-    } else if (vv > b[8]) {
-        value_w = 1.0f - sstep(b[8], b[8] + 0.05f, vv);
-    } else {
-        value_w = 1.0f;
-    }
-    return clampf(hue_w * sat_w * value_w, 0.0f, 1.0f);
+    // C1 HueBandWeight * ChromaBandWeight: no value selection band (b[7..9]
+    // are carried but unused), matching CPU processing::color::band_weight.
+    (void)v;
+    return clampf(hue_w * sat_w, 0.0f, 1.0f);
 }
 
 static __device__ __forceinline__ float color_range_weight(
@@ -819,22 +813,26 @@ static __device__ __forceinline__ float color_range_weight(
     return hue_w * sstep(min_saturation * 0.5f, min_saturation + 0.05f, s);
 }
 
-static __device__ __forceinline__ void apply_homogeneity(
-    const float* band, const float* homogeneity, float w, float* h, float* s, float* v) {
-    float hue = homogeneity[0] / 100.0f * w;
-    if (hue != 0.0f) {
-        *h += signed_hue_delta(band[0], *h) * hue;
+// C1 asymmetric quadratic damping for skin lightness uniformity
+// (CPU processing::color::skin_luma_uniform_step).
+static __device__ __forceinline__ float skin_luma_uniform_step(
+    float l_cur, float l_target, float uniformity) {
+    float lt = clampf(l_target, 0.001f, 99.999f);
+    float q;
+    if (l_cur < lt) {
+        q = l_cur / lt;
+    } else {
+        float k = 4.0f * (0.5f * (sqrtf(4.0625f) + 0.25f) - 1.0f);
+        q = 1.0f - k * (l_cur - lt) / (100.0f - lt);
     }
-    float sat = homogeneity[1] / 100.0f * w;
-    if (sat != 0.0f) {
-        *s += (band[1] - *s) * sat;
-    }
-    float light = homogeneity[2] / 100.0f * w;
-    if (light != 0.0f) {
-        *v += (band[2] - *v) * light;
-    }
+    float f = 1.0f - 0.25f * q;
+    float factor = f * f;
+    float l_uniform = lt + factor * (l_cur - lt);
+    return (0.01f * uniformity) * (l_uniform - l_cur);
 }
 
+// C1 colour editor (k = 1): every term reads the source HSV, weights are
+// normalised when they sum above one; the host only sends active terms.
 static __device__ __forceinline__ float3 color_editor(float3 g, const float* P, const float* E) {
     float h0, s0, v0;
     rgb_to_hsv(make_float3(fmaxf(g.x, 0.0f), fmaxf(g.y, 0.0f), fmaxf(g.z, 0.0f)),
@@ -843,17 +841,16 @@ static __device__ __forceinline__ float3 color_editor(float3 g, const float* P, 
         return g;
     }
     float extra = fmaxf(E[E_BASIC_EXTRA], 0.0f);
-    float h = h0;
-    float s = s0;
-    float v = v0;
     float dh = 0.0f;
     float ds = 0.0f;
     float dl = 0.0f;
+    float w_sum = 0.0f;
 
     if (E[E_GLOBAL_ENABLED] != 0.0f) {
         const float* band = E + E_GLOBAL_BAND;
         float w = band_weight(band, 0.0f, h0, s0, v0);
         if (band[10] != 0.0f) w = 1.0f - w;
+        w_sum += w;
         dh += E[E_GLOBAL_SHIFT + 0] * w;
         ds += E[E_GLOBAL_SHIFT + 1] * w;
         dl += E[E_GLOBAL_SHIFT + 2] * w;
@@ -865,19 +862,23 @@ static __device__ __forceinline__ float3 color_editor(float3 g, const float* P, 
         int mode = (int)e[0];
         if (mode == 1) {
             const float* band = e + 1;
+            const float* hom = e + 13;
             float w = band_weight(band, 0.0f, h0, s0, v0);
             if (band[10] != 0.0f) w = 1.0f - w;
-            apply_homogeneity(band, e + 13, w, &h, &s, &v);
+            w_sum += w;
+            if (hom[0] != 0.0f) dh += signed_hue_delta(band[0], h0) * (hom[0] / 100.0f * w);
+            if (hom[1] != 0.0f) ds += (band[1] - s0) * hom[1] * w;
+            if (hom[2] != 0.0f) dl += skin_luma_uniform_step(v0 * 100.0f, band[2] * 100.0f, hom[2]) * w;
         } else if (mode == 2) {
             float w = color_range_weight(e + 16, e[16], e[17], e[18], e[19], g);
-            h += signed_hue_delta(e[16], h) * (e[20] / 100.0f * w);
+            w_sum += w;
+            dh += signed_hue_delta(e[16], h0) * (e[20] / 100.0f * w);
             if (e[21] > 0.0f) {
                 float target_s = clampf(e[19] + 0.35f, 0.15f, 0.55f);
-                s += (target_s - s) * (e[21] / 100.0f * w);
+                ds += (target_s - s0) * e[21] * w;
             }
             if (e[22] > 0.0f) {
-                float target_v = 0.65f;
-                v += (target_v - v) * (e[22] / 100.0f * w * 0.5f);
+                dl += skin_luma_uniform_step(v0 * 100.0f, 65.0f, e[22]) * w;
             }
         }
     }
@@ -888,8 +889,9 @@ static __device__ __forceinline__ float3 color_editor(float3 g, const float* P, 
             continue;
         }
         const float* band = e;
-        float w = band_weight(band, extra, h, s, v);
+        float w = band_weight(band, extra, h0, s0, v0);
         if (band[10] != 0.0f) w = 1.0f - w;
+        w_sum += w;
         dh += e[12] * w;
         ds += e[13] * w;
         dl += e[14] * w;
@@ -899,28 +901,34 @@ static __device__ __forceinline__ float3 color_editor(float3 g, const float* P, 
     for (int i = 0; i < n_shift; ++i) {
         const float* e = E + E_SKIN_BASE + n_skin * E_SKIN_STRIDE + i * E_SHIFT_STRIDE;
         int mode = (int)e[0];
-        if (mode == 1) {
-            continue;
-        }
         float w;
-        if (mode == 0) {
+        if (mode == 1) {
+            w = 0.0f;  // disabled band: shift kept, covers nothing
+        } else if (mode == 0) {
             const float* band = e + 2;
             w = band_weight(band, e[1], h0, s0, v0);
             if (band[10] != 0.0f) w = 1.0f - w;
         } else {
             w = color_range_weight(e + 17, e[17], e[18], e[19], e[20], g);
         }
+        w_sum += w;
         dh += e[14] * w;
         ds += e[15] * w;
         dl += e[16] * w;
     }
 
+    if (w_sum > 1.0f) {
+        float inv = 1.0f / w_sum;
+        dh *= inv;
+        ds *= inv;
+        dl *= inv;
+    }
     dh = clampf(dh, -180.0f, 180.0f);
     ds = clampf(ds, -100.0f, 100.0f);
     dl = clampf(dl, -100.0f, 100.0f);
-    float s2 = clampf(s * (1.0f + ds / 100.0f), 0.0f, 1.0f);
-    float v2 = fmaxf(v * (1.0f + dl / 100.0f * 0.5f * s), 0.0f);
-    return hsv_to_rgb(h + dh, s2, v2);
+    float s2 = clampf(s0 * (1.0f + ds / 100.0f), 0.0f, 1.0f);
+    float v2 = fmaxf(v0 * (1.0f + dl / 100.0f * 0.5f * s0), 0.0f);
+    return hsv_to_rgb(h0 + dh, s2, v2);
 }
 
 // Output banding -----------------------------------------------------------

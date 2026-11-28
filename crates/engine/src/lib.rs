@@ -19,10 +19,6 @@ mod c1catalog;
 mod c1import;
 mod c1_masks;
 pub mod c1_banding;
-pub mod dng_write;
-pub mod gpu_crossplatform;
-pub mod platform_dispatch;
-pub mod psd_write;
 pub mod c1_cos;
 pub mod c1_eip;
 pub mod c1_writeback;
@@ -54,12 +50,18 @@ mod closedeyes;
 /// Stable pixel/compute contracts shared by CPU, CUDA and Metal adapters.
 pub mod contracts;
 /// Translation from the in-crate GPU runtime vocabulary to `contracts`.
+/// `mock::gpu_runtime`'s full vocabulary only exists on Windows.
+#[cfg(windows)]
 mod compute_bridge;
 /// Persistent edit document versus per-job runtime inputs.
 pub mod document;
 mod engine;
 /// Unified job lifecycle: scoped id, state, cancellation and receipts.
 pub mod job_lifecycle;
+/// Cross-platform GPU compute: CPU oracle plus portable wgpu path.
+pub mod gpu_crossplatform;
+/// Backend availability probe and strict/auto dispatch across platforms.
+pub mod platform_dispatch;
 /// Stages migrated out of `mock` (with compatibility re-exports).
 pub mod processing;
 /// Production render pipeline facade and `RenderPlan` execution bridge.
@@ -80,6 +82,8 @@ mod filmcurve;
 pub mod face_parsing;
 mod heif;
 mod heif_write;
+pub mod dng_write;
+pub mod psd_write;
 mod highlight;
 pub mod hdr;
 pub mod pano;
@@ -283,8 +287,11 @@ pub use portrait_makeup_bundle::*;
 pub use portrait_makeup_provider::*;
 mod param_meta;
 mod preview_cache;
-pub mod disk_preview_cache;
-pub mod tile_scheduler;
+#[allow(dead_code)] // stats/invalidate/cleanup are API for later wiring; put/get are used via preview_disk
+mod disk_preview_cache;
+mod preview_disk;
+#[allow(dead_code)] // no tile-based render call site exists yet; see module docs
+mod tile_scheduler;
 mod presets;
 pub mod raw;
 pub mod aurora_raw;

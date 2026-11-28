@@ -7,6 +7,8 @@ exclude = ["work/**", "testdata/**", "examples/**", "scripts/**"]
 
 [features]
 default = ["wgpu-backend"]
+# Gates src/wgpu_compute.rs (ComputeBackend over wgpu). The legacy
+# src/wgpu_backend.rs free-function API is always compiled.
 wgpu-backend = []
 vulkan-backend = ["dep:ash"]
 

@@ -51,11 +51,14 @@ pub const COLOR_EDITOR: Status = Status::Partial("Centres, hue/saturation bands,
 pub const MOIRE: Status = Status::Partial("3×3 low-pass, no frequency-domain filter", "3×3 低通，无频域处理");
 pub const LENS_CORRECTION: Status = Status::Partial("Distortion, aberration and purple fringing direction are assumed", "畸变/色差/紫边方向为假设");
 pub const KEYSTONE: Status = Status::Partial("Direction assumed, not verified against Capture One", "方向为假设，未与 C1 对拍");
-pub const LOCAL_ADJUSTMENTS: Status = Status::Partial("Copied shapes carry zero weight", "复制形状权重为 0");
-/// The node graph is stored with the variant; engines still render the layer list in series.
+/// Copy masks read their source layer's mask whatever its draw position or enabled state.
+pub const LOCAL_ADJUSTMENTS: Status = Status::Ready;
+/// The node graph is stored with the variant. The engine blends parallel and layer mixers
+/// (CPU path shared by preview, export and the picker); a mixer input that is itself a mixer
+/// counts as opaque, and luma/colour-range masks are measured on the branch input.
 pub const NODE_GRAPH: Status = Status::Partial(
-    "Parallel and layer mixers render their branches in series; disconnected nodes are pruned from render and export alike",
-    "并行与图层混合器暂按串联渲染分支；未连接的节点在渲染与导出中都会被剪掉",
+    "Parallel mixers sum their branches' changes to the shared input and layer mixers stack inputs by mask; disconnected nodes are pruned from render and export alike; a mixer feeding a layer mixer counts as opaque",
+    "并行混合器把各分支相对共同输入的改动相加，图层混合器按蒙版叠放输入；未连接的节点在渲染与导出中都会被剪掉；接入图层混合器的混合器按不透明处理",
 );
 pub const SPOTS: Status = Status::Partial("Healing is approximate", "修复为近似实现");
 pub const C1_CATALOG: Status = Status::Partial("Collections and WAL only", "仅集合与 WAL");
@@ -77,8 +80,8 @@ pub const MERGE: Status = Status::Partial(
     "Basic HDR and panorama merges are available; panorama projection (Perspective/Cylindrical/Spherical/Panini) and HDR deghosting (Off/Auto/Manual) are consumed; frame alignment, auto tone, boundary warp and auto crop are not",
     "基础 HDR/全景合并可用；全景投影（透视/圆柱/球面/Panini）与 HDR 去鬼影（关/自动/手动）已消费；对齐、自动色调、边界变形与自动裁剪尚未消费",
 );
-pub const STYLE_IMPORT: Status = Status::Partial("Imported styles are available for this session", "导入风格在当前会话可用");
-pub const SESSIONS: Status = Status::Partial("Session import is read-only; XMP write-back and .P1X are not connected yet", "Session 支持只读导入；XMP 写回与 .P1X 尚未接入");
+pub const STYLE_IMPORT: Status = Status::Partial("Capture One .costyle/.copreset and Lightroom .xmp presets import read-only and are available for this session", "Capture One .costyle/.copreset 与 Lightroom .xmp 预设只读导入，在当前会话可用");
+pub const SESSIONS: Status = Status::Partial("Capture One session and Lightroom .lrcat import are read-only; XMP write-back and .P1X are not connected yet", "Capture One Session 与 Lightroom .lrcat 支持只读导入；XMP 写回与 .P1X 尚未接入");
 pub const PRINT: Status = Status::Partial("Single-page PDF output is available; system printers, multi-image layouts and ICC proofing are not connected", "单页 PDF 输出可用；系统打印机、多图版式与 ICC 打样尚未接入");
 pub const RETOUCH: Status = Status::Pending("Saved with the variant; the engine does not render it yet", "随变体保存，渲染管线尚未实现");
 pub const SURFACE_NOISE: Status = Status::Pending("Surface smoothness has no engine field yet", "表面平滑尚无引擎字段");

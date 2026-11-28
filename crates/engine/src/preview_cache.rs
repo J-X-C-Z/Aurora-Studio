@@ -277,6 +277,47 @@ pub(crate) fn key(
     }
 }
 
+/// Process-independent identity of everything [`key`] hashes, as text, for the
+/// on-disk preview cache. It is built from the same fingerprints, the output
+/// size, the region, the bypass flag and the engine build/algorithm version
+/// ([`RENDER_VERSION`] plus the package/build id), so a different engine build
+/// never matches.
+///
+/// `None` when the request cannot be named stably (a mask overlay hash is a
+/// process-local value). The digest still does NOT cover producer/runtime
+/// inputs, AI mask caches, or whether the GPU or CPU numeric path rendered the
+/// frame, so the disk cache must only serve such a frame as a placeholder that
+/// the real render always replaces.
+pub(crate) fn persistent_digest(
+    adj: &AdjustmentSet,
+    region: NormRect,
+    max_size: u32,
+    bypass: bool,
+    mask_overlay: Option<u64>,
+    fast: bool,
+) -> Option<String> {
+    if mask_overlay.is_some() {
+        return None;
+    }
+    let p = ParamsFingerprint::of(adj);
+    Some(format!(
+        "pv1-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{:016x}-{max_size}-{:x}.{:x}.{:x}.{:x}-{}{}",
+        build_fingerprint(),
+        p.characterization,
+        p.geometry,
+        p.develop,
+        p.detail,
+        p.local,
+        p.portrait,
+        region.x.to_bits(),
+        region.y.to_bits(),
+        region.width.to_bits(),
+        region.height.to_bits(),
+        u8::from(bypass),
+        u8::from(fast),
+    ))
+}
+
 /// Semantic groups of the parameter fingerprint.
 ///
 /// [`PreviewKey`] compares all six groups, so a change in any of them still

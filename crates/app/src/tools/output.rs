@@ -315,7 +315,7 @@ fn summary_panel(state: &Entity<AppState>, cx: &App) -> impl IntoElement + use<>
             let bpp = match r.format {
                 ExportFormat::Tiff | ExportFormat::Psd => 3.0 * r.bit_depth as f64 / 8.0,
                 ExportFormat::Png => 1.6,
-                ExportFormat::Dng => 2.0,
+                ExportFormat::Dng => 6.0,
                 _ => 0.25 * r.quality as f64 / 90.0,
             };
             pixels * bpp / 1e6

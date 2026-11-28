@@ -74,7 +74,7 @@ impl ExportFormat {
     pub fn is_supported(self) -> bool {
         match self {
             Self::Heif => crate::heif_write::available(),
-            _ => matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::WebP),
+            _ => matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::WebP | Self::Dng | Self::Psd),
         }
     }
 
@@ -91,17 +91,18 @@ impl ExportFormat {
         }
     }
 
-    /// Whether this format can be written at `depth` bits. Only PNG and TIFF
-    /// have a 16-bit encoder; requesting 16 bits for anything else is an
-    /// error, never a silent downgrade.
+    /// Whether this format can be written at `depth` bits. Only PNG, TIFF,
+    /// HEIF, PSD and DNG have a 16-bit encoder; requesting 16 bits for
+    /// anything else is an error, never a silent downgrade. DNG is always
+    /// stored as 16-bit samples (an 8-bit request is widened losslessly).
     pub fn supports_bit_depth(self, depth: u8) -> anyhow::Result<()> {
         match depth {
             8 => Ok(()),
             // HEIF stores 10/12-bit HEVC; the recipe's 16-bit buffer is
             // quantised to 12 bits by `heif_write::encode_rgb16`.
-            16 if matches!(self, Self::Png | Self::Tiff | Self::Heif) => Ok(()),
+            16 if matches!(self, Self::Png | Self::Tiff | Self::Heif | Self::Psd | Self::Dng) => Ok(()),
             _ => anyhow::bail!(
-                "{self:?} has no {depth}-bit encoder; only PNG, TIFF and HEIF support 16-bit"
+                "{self:?} has no {depth}-bit encoder; only PNG, TIFF, HEIF, PSD and DNG support 16-bit"
             ),
         }
     }
@@ -147,7 +148,7 @@ impl std::fmt::Display for UnsupportedFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "export: {} (.{}) is not implemented; supported formats are JPEG, PNG, TIFF and WebP",
+            "export: {} (.{}) is not implemented; supported formats are JPEG, PNG, TIFF, WebP, DNG, PSD and HEIF when libheif is installed",
             self.format.label(),
             self.format.extension()
         )

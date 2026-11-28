@@ -4,22 +4,18 @@
 
 use std::time::Instant;
 
-use crate::android_qnn_vulkan::{
-    select_vulkan_candidate, AndroidGpuArchitecture, VulkanDeviceFeatures,
-};
 use crate::autotune::{AdapterProbeRecord, BackendTiming, CandidateSpec, ExecutionMode, VerificationStatus};
 use crate::compute_backend::{
     ComputeBackend, ComputeError, CpuComputeBackend, ExecutionReceipt, PixelStageFusion,
 };
 use crate::cuda_backend::{self, CudaComputeBackend, FusionLaunchConfig};
 use crate::device::{Backend, DeviceProbe, AUTO_GPU_PRIORITY};
-use crate::harmony_ohos::{ohos_vulkan_candidate, plan_ohos_vulkan, OhosVulkanProbe};
 use crate::hip_backend::{HipComputeBackend, HIP_CANDIDATES};
 use crate::metal_backend::{MetalComputeBackend, APPLE_CANDIDATES};
 use crate::simd_ops::{execute_fused_simd, SimdCapabilities};
 use crate::sycl_openvino_backend::{probe_level_zero, INTEL_CANDIDATES};
 #[cfg(feature = "wgpu-backend")]
-use crate::wgpu_compute_backend::{self as wgpu_backend, WgpuBackendSelector, WgpuComputeBackend};
+use crate::wgpu_compute::{self as wgpu_backend, WgpuBackendSelector, WgpuComputeBackend};
 use crate::Image;
 
 const fn host_platform_label() -> &'static str {
@@ -289,19 +285,7 @@ pub fn all_autotune_candidates() -> Vec<CandidateSpec> {
     specs.extend_from_slice(HIP_CANDIDATES);
     specs.extend_from_slice(INTEL_CANDIDATES);
 
-    for arch in [
-        AndroidGpuArchitecture::Adreno,
-        AndroidGpuArchitecture::Mali,
-        AndroidGpuArchitecture::Immortalis,
-        AndroidGpuArchitecture::Xclipse,
-    ] {
-        if let Ok(candidate) = select_vulkan_candidate(&VulkanDeviceFeatures::synthetic(arch)) {
-            specs.push(candidate.spec);
-        }
-    }
-    if let Ok(plan) = plan_ohos_vulkan(&OhosVulkanProbe::synthetic()) {
-        specs.push(ohos_vulkan_candidate(&plan));
-    }
+    // Android QNN/Vulkan and HarmonyOS candidates are deferred (not ported).
     specs
 }
 
@@ -606,7 +590,7 @@ mod tests {
         assert!(probes.iter().any(|p| p.backend == Backend::Cuda));
 
         let candidates = all_autotune_candidates();
-        assert!(candidates.len() >= 25, "got {} candidates", candidates.len());
+        assert!(candidates.len() >= 18, "got {} candidates", candidates.len());
         assert!(candidates.iter().any(|c| c.backend == Backend::Cuda));
         assert!(candidates.iter().any(|c| c.backend == Backend::Metal));
         assert!(candidates.iter().any(|c| c.backend == Backend::Hip));

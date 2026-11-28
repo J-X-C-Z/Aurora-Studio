@@ -318,10 +318,10 @@ mod tests {
     #[test]
     fn plan_rejects_unsupported_format_and_bad_scale() {
         let mut psd = ProcessRecipe::default();
-        psd.format = ExportFormat::Psd;
+        psd.format = ExportFormat::JpegXl;
         assert!(matches!(
             ExportPlan::from_recipe(&psd, (800, 600), &Geometry::default()),
-            Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::Psd, .. })
+            Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::JpegXl, .. })
         ));
 
         let mut bad_scale = ProcessRecipe::default();

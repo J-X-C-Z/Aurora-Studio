@@ -707,7 +707,7 @@ pub fn resolve_profile(name: &str) -> Option<OutputProfile> {
     if tokens.is_empty() {
         return None;
     }
-    for (stem, path) in icc::scan_profiles(&[icc::profile_dir()]) {
+    for (stem, path) in icc::scan_profiles(&icc::search_dirs()) {
         let stem_lower = stem.to_ascii_lowercase();
         if !tokens.iter().any(|t| stem_lower.contains(t.as_str())) {
             continue;
@@ -1768,7 +1768,9 @@ fn write_export_pixels(
     if let Some(wide) = wide.as_mut().filter(|_| sharpen_8bit) {
         fold_eight_bit_edits(wide, &rgba);
     }
-    if let Some(target) = profile.as_ref() {
+    // DNG carries linear sRGB described by its own colour matrix, never an
+    // output ICC, so its pixels stay in sRGB here.
+    if let Some(target) = profile.as_ref().filter(|_| recipe.format != ExportFormat::Dng) {
         if let Some(wide) = wide.as_mut() {
             if !is_srgb(&target.profile, &target.path) {
                 icc::convert_srgb16_to(wide, &target.profile);
@@ -2100,7 +2102,7 @@ fn write_heif_file(
 
 /// Encodes `rgba` in the recipe's format and returns the bytes and extension.
 ///
-/// JpegXl, Dng and Psd have no encoder in the `image` crate and fail with
+/// JpegXl has no encoder in the `image` crate and fails with
 /// [`UnsupportedFormat`] rather than falling back to JPEG. Heif uses the
 /// runtime libheif encoder when it is installed.
 fn encode(
@@ -2162,8 +2164,14 @@ fn encode(
                     "heic",
                 ));
             }
+            ExportFormat::Dng => {
+                return Ok((encode_dng_rgb16(wide, w, h)?, "dng"));
+            }
+            ExportFormat::Psd => {
+                return Ok((encode_psd_rgba16(wide, w, h, icc)?, "psd"));
+            }
             other => anyhow::bail!(
-                "export: {other:?} has no 16-bit encoder; use PNG, TIFF or HEIF"
+                "export: {other:?} has no 16-bit encoder; use PNG, TIFF, PSD, DNG or HEIF"
             ),
         }
     }
@@ -2233,8 +2241,78 @@ fn encode(
             crate::heif_write::encode_to_vec(rgba, w, h, quality, icc, exif, xmp)?,
             "heic",
         )),
+        ExportFormat::Dng => {
+            // DNG always carries 16-bit samples; widen 8 -> 16 exactly (x * 257).
+            let wide: Vec<u16> = rgba.iter().map(|&v| u16::from(v) * 257).collect();
+            Ok((encode_dng_rgb16(&wide, w, h)?, "dng"))
+        }
+        ExportFormat::Psd => Ok((encode_psd_rgba8(rgba, w, h, icc)?, "psd")),
         other => Err(UnsupportedFormat { format: other }.into()),
     }
+}
+
+/// Rendered RGB DNG (`LinearRaw`) from interleaved gamma-encoded sRGB
+/// RGBA16; alpha is dropped. Samples are decoded to linear sRGB, which the
+/// DNG's colour matrix describes. Neither ICC nor EXIF is embedded.
+fn encode_dng_rgb16(rgba16: &[u16], w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
+    let lut = srgb16_to_linear16_lut();
+    let rgb: Vec<u16> = rgba16
+        .chunks_exact(4)
+        .flat_map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])
+        .collect();
+    crate::dng_write::encode_linear_dng16(&crate::dng_write::DngImage {
+        width: w,
+        height: h,
+        pixels_rgb16: &rgb,
+        unique_camera_model: "Aurora Studio Rendered RGB",
+    })
+}
+
+/// sRGB EOTF over every 16-bit code, rounded to 16-bit linear.
+fn srgb16_to_linear16_lut() -> &'static [u16] {
+    static LUT: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        (0..=u16::MAX)
+            .map(|v| {
+                let c = f64::from(v) / 65535.0;
+                let l = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+                (l * 65535.0).round().clamp(0.0, 65535.0) as u16
+            })
+            .collect()
+    })
+}
+
+/// PSD (RGB, merged image only, no layers) from interleaved RGBA8; alpha is
+/// dropped. The ICC profile goes into image resource 1039.
+fn encode_psd_rgba8(rgba: &[u8], w: u32, h: u32, icc: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    use crate::psd_write::{PsdImage, PsdPixels, PsdSampleDepth};
+    let n = rgba.len() / 4;
+    let mut planes = vec![0u8; n * 3];
+    for (i, px) in rgba.chunks_exact(4).enumerate() {
+        planes[i] = px[0];
+        planes[n + i] = px[1];
+        planes[2 * n + i] = px[2];
+    }
+    crate::psd_write::encode_psd_with_icc(
+        &PsdImage { width: w, height: h, depth: PsdSampleDepth::Eight, merged: PsdPixels::U8(&planes), layers: &[] },
+        icc,
+    )
+}
+
+/// 16-bit counterpart of [`encode_psd_rgba8`].
+fn encode_psd_rgba16(rgba16: &[u16], w: u32, h: u32, icc: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    use crate::psd_write::{PsdImage, PsdPixels, PsdSampleDepth};
+    let n = rgba16.len() / 4;
+    let mut planes = vec![0u16; n * 3];
+    for (i, px) in rgba16.chunks_exact(4).enumerate() {
+        planes[i] = px[0];
+        planes[n + i] = px[1];
+        planes[2 * n + i] = px[2];
+    }
+    crate::psd_write::encode_psd_with_icc(
+        &PsdImage { width: w, height: h, depth: PsdSampleDepth::Sixteen, merged: PsdPixels::U16(&planes), layers: &[] },
+        icc,
+    )
 }
 
 /// The XMP signature that opens a JPEG APP1 XMP segment, NUL included.
@@ -3124,7 +3202,7 @@ mod tests {
 
     #[test]
     fn unsupported_formats_fail_and_write_nothing() {
-        for format in [ExportFormat::JpegXl, ExportFormat::Dng, ExportFormat::Psd] {
+        for format in [ExportFormat::JpegXl] {
             let base = temp_dir("unsupported");
             let dir = base.join("out");
             let mut r = recipe(ScaleMode::Fixed100, (0, 0));
@@ -3139,11 +3217,121 @@ mod tests {
         }
     }
 
+    fn gradient_rgba(w: u32, h: u32) -> Vec<u8> {
+        (0..w * h).flat_map(|i| [(i * 3 % 256) as u8, (i * 5 % 256) as u8, (i * 7 % 256) as u8, 255]).collect()
+    }
+
+    #[test]
+    fn psd_export_writes_a_parseable_8bit_file() {
+        let base = temp_dir("psd8");
+        let dir = base.join("out");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Psd;
+        let path = write_export(&dir, &info(), &r, 0, gradient_rgba(8, 4), 8, 4, |_| {}).unwrap();
+        assert_eq!(path.extension().unwrap(), "psd");
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(&b[0..4], b"8BPS");
+        assert_eq!(u16::from_be_bytes([b[4], b[5]]), 1);
+        assert_eq!(u16::from_be_bytes([b[12], b[13]]), 3, "channels");
+        assert_eq!(u32::from_be_bytes(b[14..18].try_into().unwrap()), 4, "height");
+        assert_eq!(u32::from_be_bytes(b[18..22].try_into().unwrap()), 8, "width");
+        assert_eq!(u16::from_be_bytes([b[22], b[23]]), 8, "depth");
+        assert_eq!(u16::from_be_bytes([b[24], b[25]]), 3, "RGB mode");
+        // Last 2 + 3*32 bytes: raw compression marker then the R plane first.
+        let tail = &b[b.len() - (2 + 3 * 32)..];
+        assert_eq!(&tail[0..2], &[0, 0]);
+        assert_eq!(tail[2], 0);
+        assert_eq!(tail[3], 3);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn psd_export_embeds_icc_for_a_wide_gamut_profile() {
+        let base = temp_dir("psd-icc");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Psd;
+        r.icc_profile = "LeafLF2-LF2 Portrait 5".into();
+        let path = write_export(&base, &info(), &r, 0, gradient_rgba(8, 4), 8, 4, |_| {}).unwrap();
+        let b = std::fs::read(&path).unwrap();
+        // Image resources length (offset 30) is non-zero and holds resource 1039.
+        let res_len = u32::from_be_bytes(b[30..34].try_into().unwrap());
+        if res_len > 0 {
+            assert_eq!(&b[34..38], b"8BIM");
+            assert_eq!(u16::from_be_bytes([b[38], b[39]]), 1039);
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn psd_16bit_encoder_writes_16bit_planes() {
+        let wide: Vec<u16> = (0..8 * 4).flat_map(|i| [i as u16 * 1000, 2, 3, 65535]).collect();
+        let b = encode_psd_rgba16(&wide, 8, 4, None).unwrap();
+        assert_eq!(&b[0..4], b"8BPS");
+        assert_eq!(u16::from_be_bytes([b[22], b[23]]), 16);
+        assert_eq!(u16::from_be_bytes([b[12], b[13]]), 3);
+        let tail = &b[b.len() - (2 + 3 * 32 * 2)..];
+        assert_eq!(u16::from_be_bytes([tail[2], tail[3]]), 0);
+        assert_eq!(u16::from_be_bytes([tail[4], tail[5]]), 1000);
+    }
+
+    #[test]
+    fn dng_export_writes_a_parseable_16bit_tiff() {
+        let base = temp_dir("dng8");
+        let dir = base.join("out");
+        let mut r = recipe(ScaleMode::Fixed100, (0, 0));
+        r.format = ExportFormat::Dng;
+        let path = write_export(&dir, &info(), &r, 0, gradient_rgba(8, 4), 8, 4, |_| {}).unwrap();
+        assert_eq!(path.extension().unwrap(), "dng");
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(&b[0..4], b"II\x2a\x00");
+        let ifd = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let n = u16::from_le_bytes([b[ifd], b[ifd + 1]]) as usize;
+        let mut tags = std::collections::HashMap::new();
+        for i in 0..n {
+            let e = ifd + 2 + i * 12;
+            tags.insert(
+                u16::from_le_bytes([b[e], b[e + 1]]),
+                u32::from_le_bytes(b[e + 8..e + 12].try_into().unwrap()),
+            );
+        }
+        assert_eq!(tags[&256], 8, "width");
+        assert_eq!(tags[&257], 4, "height");
+        assert_eq!(tags[&277], 3, "samples per pixel");
+        assert_eq!(tags[&262], 34892, "LinearRaw");
+        assert!(tags.contains_key(&50706), "DNGVersion");
+        let strip = tags[&273] as usize;
+        assert_eq!(b.len(), strip + 8 * 4 * 6);
+        // Second pixel R: 8-bit 3 widened (3 * 257), then decoded to linear sRGB.
+        let lut = srgb16_to_linear16_lut();
+        assert_eq!(u16::from_le_bytes([b[strip + 6], b[strip + 7]]), lut[3 * 257]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn dng_16bit_encoder_keeps_samples() {
+        let wide: Vec<u16> = (0..4).flat_map(|i| [i as u16 * 20000, 5, 6, 65535]).collect();
+        let b = encode_dng_rgb16(&wide, 2, 2).unwrap();
+        let strip = b.len() - 2 * 2 * 6;
+        assert_eq!(u16::from_le_bytes([b[strip + 6], b[strip + 7]]), srgb16_to_linear16_lut()[20000]);
+    }
+
+    /// The DNG samples are linear sRGB: black and white are fixed points,
+    /// mid-grey (sRGB 0.5) decodes to about 0.214, and the curve is monotonic.
+    #[test]
+    fn dng_samples_are_linear_srgb() {
+        let lut = srgb16_to_linear16_lut();
+        assert_eq!(lut[0], 0);
+        assert_eq!(lut[65535], 65535);
+        let mid = f64::from(lut[32768]) / 65535.0;
+        assert!((mid - 0.2140).abs() < 1e-3, "{mid}");
+        assert!(lut.windows(2).all(|w| w[0] <= w[1]));
+    }
+
     #[test]
     fn the_export_error_carries_the_format() {
-        let err = ExportFormat::Dng.ensure_supported().unwrap_err();
+        let err = ExportFormat::JpegXl.ensure_supported().unwrap_err();
         let unsupported = err.downcast_ref::<UnsupportedFormat>().expect("structured format error");
-        assert_eq!(unsupported.format, ExportFormat::Dng);
+        assert_eq!(unsupported.format, ExportFormat::JpegXl);
     }
 
     #[test]
@@ -3181,7 +3369,7 @@ mod tests {
             assert!(format.supports_bit_depth(8).is_ok(), "{format:?}");
             assert_eq!(
                 format.supports_bit_depth(16).is_ok(),
-                matches!(format, ExportFormat::Png | ExportFormat::Tiff | ExportFormat::Heif),
+                matches!(format, ExportFormat::Png | ExportFormat::Tiff | ExportFormat::Heif | ExportFormat::Psd | ExportFormat::Dng),
                 "{format:?}"
             );
         }
@@ -3190,6 +3378,7 @@ mod tests {
     // --------------------------------------------------------------- ICC
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn icc_profile_changes_the_output() {
         let dir = temp_dir("icc");
         let mut srgb = recipe(ScaleMode::Fixed100, (0, 0));
@@ -3210,6 +3399,11 @@ mod tests {
 
     #[test]
     fn the_icc_profile_is_embedded_in_the_file() {
+        // Needs the system sRGB profile (Windows colour folder, macOS ColorSync).
+        if resolve_profile("sRGB IEC61966-2.1").is_none() {
+            eprintln!("no installed sRGB IEC61966-2.1 profile; skipping");
+            return;
+        }
         let dir = temp_dir("icc-embed");
         let mut r = recipe(ScaleMode::Fixed100, (0, 0));
         r.icc_profile = "sRGB IEC61966-2.1".into();

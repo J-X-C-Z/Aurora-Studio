@@ -163,22 +163,18 @@ fn a5_persistent_document_is_isolated_from_runtime_inputs() {
     adj.exposure.exposure = 1.25;
     adj.extra.insert("pc:30025".to_string(), 50.0);
 
-    let producer_a = ProducerInputs {
-        smile: Some(SmileProducerInputs {
-            ticket: 101,
-            material: Some(SENTINEL_A.to_string()),
-            ..SmileProducerInputs::default()
-        }),
-        ..ProducerInputs::default()
-    };
-    let producer_b = ProducerInputs {
-        smile: Some(SmileProducerInputs {
-            ticket: 202,
-            material: Some(SENTINEL_B.to_string()),
-            ..SmileProducerInputs::default()
-        }),
-        ..ProducerInputs::default()
-    };
+    let mut producer_a = ProducerInputs::default();
+    producer_a.smile = Some(SmileProducerInputs {
+        ticket: 101,
+        material: Some(SENTINEL_A.to_string()),
+        ..SmileProducerInputs::default()
+    });
+    let mut producer_b = ProducerInputs::default();
+    producer_b.smile = Some(SmileProducerInputs {
+        ticket: 202,
+        material: Some(SENTINEL_B.to_string()),
+        ..SmileProducerInputs::default()
+    });
 
     let runtime_a = RuntimeInputs::new(Some(Arc::new(producer_a)));
     let runtime_b = RuntimeInputs::new(Some(Arc::new(producer_b)));
@@ -527,10 +523,10 @@ fn a5_export_plan_explicitly_rejects_invalid_bit_depth_zero_size_and_bad_directo
 
     // 4) Unsupported format & invalid scale parameter.
     let mut unsupported = ProcessRecipe::default();
-    unsupported.format = ExportFormat::Dng;
+    unsupported.format = ExportFormat::JpegXl;
     assert!(matches!(
         ExportPlan::from_recipe(&unsupported, (1000, 800), &geom),
-        Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::Dng, .. })
+        Err(ExportPlanError::UnsupportedFormat { format: ExportFormat::JpegXl, .. })
     ));
 
     let mut bad_scale = ProcessRecipe::default();

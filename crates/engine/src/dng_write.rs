@@ -1,7 +1,7 @@
 //! 线性 DNG 1.6（TIFF/EP 架构）编码器。
 //!
 //! 本模块把行优先、交错的 16-bit RGB 样本写成一个**最小但结构完整**的
-//! LinearRaw DNG：小端 TIFF 头 + 单个 IFD（标签按 tag 升序）+ 4 字节对齐的
+//! LinearRaw DNG（样本为线性 sRGB，ColorMatrix1 为 XYZ D65 → 线性 sRGB）：小端 TIFF 头 + 单个 IFD（标签按 tag 升序）+ 4 字节对齐的
 //! 数据区 + 未压缩的像素 strip。不依赖 `tiff` crate，字节全部自行组装。
 //!
 //! **静态验证，不等于 Adobe DNG 验证器通过/真机对拍。**
@@ -132,6 +132,13 @@ fn align4(x: u32) -> Result<u32> {
         .ok_or_else(|| anyhow!("DNG offset alignment overflow"))
 }
 
+/// XYZ (D65) -> linear sRGB (IEC 61966-2-1), as SRATIONAL /10000.
+pub(crate) const XYZ_D65_TO_LINEAR_SRGB: [(i32, i32); 9] = [
+    (32405, 10000), (-15371, 10000), (-4985, 10000),
+    (-9693, 10000), (18760, 10000), (416, 10000),
+    (556, 10000), (-2040, 10000), (10572, 10000),
+];
+
 /// 编码线性 16-bit DNG 1.6 字节流。
 ///
 /// 返回小端 TIFF 字节；任何长度/偏移溢出或非法输入均以 `Err` 返回，不 panic。
@@ -180,15 +187,10 @@ pub fn encode_linear_dng16(image: &DngImage<'_>) -> Result<Vec<u8>> {
         ascii_entry(50708, image.unique_camera_model)?,   // UniqueCameraModel
         long_entry(50714, &[0, 0, 0])?,                   // BlackLevel (3 channels)
         long_entry(50717, &[65535, 65535, 65535])?,       // WhiteLevel (3 channels)
-        // ColorMatrix1: 3x3 identity, nine real SRATIONAL values in the data area.
-        srational_entry(
-            50721,
-            &[
-                (1, 1), (0, 1), (0, 1),
-                (0, 1), (1, 1), (0, 1),
-                (0, 1), (0, 1), (1, 1),
-            ],
-        )?,
+        // ColorMatrix1: XYZ (D65) -> camera space. The samples are linear
+        // sRGB, so the "camera" is linear sRGB and this is the IEC 61966-2-1
+        // XYZ -> linear sRGB matrix, referenced to CalibrationIlluminant1 D65.
+        srational_entry(50721, &XYZ_D65_TO_LINEAR_SRGB)?,
         rational_entry(50728, &[(1, 1), (1, 1), (1, 1)])?, // AsShotNeutral
         srational_entry(50730, &[(0, 1)])?,               // BaselineExposure 0 EV
         short_entry(50778, &[21])?,                       // CalibrationIlluminant1 = D65
@@ -520,14 +522,7 @@ mod tests {
         assert_eq!(t.type_and_count(50717), (T_LONG, 3));
         assert_eq!(t.u32s(50717), vec![65535, 65535, 65535]);
         assert_eq!(t.type_and_count(50721), (T_SRATIONAL, 9));
-        assert_eq!(
-            t.srationals(50721),
-            vec![
-                (1, 1), (0, 1), (0, 1),
-                (0, 1), (1, 1), (0, 1),
-                (0, 1), (0, 1), (1, 1),
-            ]
-        );
+        assert_eq!(t.srationals(50721), super::XYZ_D65_TO_LINEAR_SRGB.to_vec());
         assert_eq!(t.type_and_count(50728), (T_RATIONAL, 3));
         assert_eq!(t.rationals(50728), vec![(1, 1), (1, 1), (1, 1)]);
         assert_eq!(t.type_and_count(50730), (T_SRATIONAL, 1));

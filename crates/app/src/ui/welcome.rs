@@ -182,7 +182,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> An
                 "welcome-catalog",
                 IconName::Library,
                 t("Open Capture One Catalog…", "打开 Capture One 目录…"),
-                t("Import a .cocatalog or session read-only.", "只读导入 .cocatalog 目录或会话。"),
+                t("Import a .cocatalog, session or Lightroom .lrcat read-only.", "只读导入 .cocatalog 目录、会话或 Lightroom .lrcat。"),
                 contract::C1_CATALOG.chip(),
                 busy,
                 cx,

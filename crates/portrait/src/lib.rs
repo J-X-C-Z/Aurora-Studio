@@ -77,6 +77,11 @@ pub mod effect_router;
 pub mod shader_catalog;
 pub mod native_infer;
 
+// Cross-platform compute layers (platform-agnostic CPU oracle + vendor adapters).
+/// Portable wgpu implementation of `compute_backend::ComputeBackend`
+/// (distinct from the legacy free-function API in `wgpu_backend`).
+pub mod wgpu_compute;
+
 /// Packed RGBA8 image, row-major, four bytes per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {

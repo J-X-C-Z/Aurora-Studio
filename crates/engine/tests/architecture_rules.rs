@@ -343,11 +343,12 @@ fn arch_rule1_app_talks_only_through_image_engine() {
     // added occurrence must. The current lines are captured in
     // docs/architecture/ARCHITECTURE-CHECKS.md.
     //
-    // * source.rs constructs concrete `FileEngine` values and immediately erases
-    //   them to `Arc<dyn ImageEngine>`; processing calls still go through the trait.
+    // * source.rs constructs concrete `FileEngine` values (import, `open_catalog`,
+    //   `open`, `create_session`, `create_catalog`) and immediately erases them to
+    //   `Arc<dyn ImageEngine>`; processing calls still go through the trait.
     // * state/mod.rs usages are inside `#[cfg(test)] mod import_edits_tests`.
     const EXCEPTIONS: &[(&str, &str, usize)] = &[
-        ("crates/app/src/state/source.rs", "FileEngine", 3),
+        ("crates/app/src/state/source.rs", "FileEngine", 5),
         ("crates/app/src/state/mod.rs", "FileEngine", 2),
     ];
 
@@ -617,16 +618,31 @@ const CUDA_PTX_FILES: &[&str] = &[
     "crates/portrait/src/cuda_uvmap.rs",
     "crates/portrait/src/cuda_v2fuseoffset.rs",
     "crates/portrait/src/cuda_v2warp.rs",
+    // Portrait stage effects bridge: in-file cfg(windows) driver path,
+    // cfg(not(windows)) returns the CPU result.
+    "crates/engine/src/portrait_stage.rs",
+    // Pixel-fusion backend: in-file cfg(windows) / cfg(not(windows)) split.
+    "crates/portrait/src/cuda_backend.rs",
+    // Native-inference graph executor: non-Windows adapter, see below.
+    "crates/portrait/src/native_infer_cuda.rs",
 ];
 
 /// Files that embed PTX but are neither module-gated nor contain an in-file
 /// `#[cfg(windows)]`. They stay cross-platform through an explicit adapter stub
 /// elsewhere; the reason is recorded here.
-const NON_WINDOWS_ADAPTER_EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/engine/src/blemish_gainmap_cuda.rs",
-    "delegates to aurora_portrait::cuda, whose non-Windows impl is the stub at \
-     crates/portrait/src/cuda.rs (cfg(not(windows)) Nvidia, ~line 3506)",
-)];
+const NON_WINDOWS_ADAPTER_EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/engine/src/blemish_gainmap_cuda.rs",
+        "delegates to aurora_portrait::cuda, whose non-Windows impl is the stub at \
+         crates/portrait/src/cuda.rs (cfg(not(windows)) Nvidia, ~line 3506)",
+    ),
+    (
+        "crates/portrait/src/native_infer_cuda.rs",
+        "opens the PTX through aurora_portrait::cuda::Nvidia, whose non-Windows impl \
+         is the stub in crates/portrait/src/cuda.rs; ExecutionMode::AutoFallback then \
+         runs the CPU graph executor and Strict reports the missing device",
+    ),
+];
 
 #[test]
 fn arch_rule5_cuda_ptx_includes_are_platform_gated() {

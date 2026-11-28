@@ -41,14 +41,14 @@ pub fn display_name(path: &Path) -> String {
 pub fn is_catalog(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| ["cocatalog", "cocatalogdb", "cosessiondb", "cos"].contains(&e.to_ascii_lowercase().as_str()))
+        .is_some_and(|e| ["cocatalog", "cocatalogdb", "cosessiondb", "cos", "lrcat"].contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Opens `path` with the engine that reads it. Runs off the main thread: a
 /// folder is scanned before this returns.
 pub fn open(path: &Path) -> anyhow::Result<(Arc<dyn ImageEngine>, Source)> {
     if is_catalog(path) {
-        Ok((Arc::new(FileEngine::open_c1_catalog(path)?), Source::Catalog(path.to_path_buf())))
+        Ok((Arc::new(FileEngine::open_catalog(path)?), Source::Catalog(path.to_path_buf())))
     } else if path.is_dir() {
         Ok((Arc::new(FileEngine::open(path)?), Source::Folder(path.to_path_buf())))
     } else {

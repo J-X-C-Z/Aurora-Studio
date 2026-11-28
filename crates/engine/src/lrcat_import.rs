@@ -321,6 +321,58 @@ impl LrcatCatalog {
     }
 }
 
+/// One Lightroom collection (`AgLibraryCollection`) and its member image ids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LrcatCollection {
+    pub id: i64,
+    pub name: String,
+    /// `Adobe_images.id_local` of each member, ascending.
+    pub image_ids: Vec<i64>,
+}
+
+impl LrcatCatalog {
+    /// Reads the user collections and their members. Smart collections have no
+    /// member rows and come back empty. A catalog without collection tables
+    /// yields an empty list rather than an error.
+    pub fn read_collections(&self) -> Result<Vec<LrcatCollection>> {
+        let has_tables: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('AgLibraryCollection', 'AgLibraryCollectionImage')",
+                [],
+                |row| row.get(0),
+            )
+            .context("probing Lightroom collection tables")?;
+        if has_tables < 2 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id_local, name FROM AgLibraryCollection ORDER BY id_local ASC")
+            .context("preparing Lightroom collection query")?;
+        let mut collections = stmt
+            .query_map([], |row| {
+                Ok(LrcatCollection {
+                    id: row.get(0)?,
+                    name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    image_ids: Vec::new(),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut members = self
+            .conn
+            .prepare("SELECT image FROM AgLibraryCollectionImage WHERE collection = ?1 ORDER BY image ASC")
+            .context("preparing Lightroom collection member query")?;
+        for collection in &mut collections {
+            collection.image_ids = members
+                .query_map([collection.id], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        }
+        Ok(collections)
+    }
+}
+
 fn build_catalog_path(root_abs: &str, folder_rel: &str, file_name: &str) -> PathBuf {
     let mut path = PathBuf::from(root_abs.trim_end_matches(['/', '\\']));
     let rel = folder_rel.trim_matches(['/', '\\']);
@@ -704,6 +756,35 @@ s = {
             [SAMPLE_LUA_DEVELOP],
         )
         .expect("insert develop settings");
+    }
+
+    #[test]
+    fn reads_collections_and_tolerates_their_absence() {
+        let path = temp_lrcat_path("collections");
+        create_sample_lrcat(&path);
+        {
+            let rw = Connection::open(&path).unwrap();
+            rw.execute_batch(
+                "CREATE TABLE AgLibraryCollection (id_local INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE AgLibraryCollectionImage (id_local INTEGER PRIMARY KEY, collection INTEGER, image INTEGER);
+                 INSERT INTO AgLibraryCollection VALUES (7, 'Picks'), (8, 'Empty');
+                 INSERT INTO AgLibraryCollectionImage (collection, image) VALUES (7, 1001), (7, 1000);",
+            )
+            .unwrap();
+        }
+        let catalog = LrcatCatalog::open_read_only(&path).unwrap();
+        let collections = catalog.read_collections().unwrap();
+        assert_eq!(collections.len(), 2);
+        assert_eq!(collections[0].name, "Picks");
+        assert_eq!(collections[0].image_ids, vec![1000, 1001]);
+        assert!(collections[1].image_ids.is_empty());
+        drop(catalog);
+        std::fs::remove_file(&path).unwrap();
+
+        let bare = temp_lrcat_path("no-collections");
+        create_sample_lrcat(&bare);
+        assert!(LrcatCatalog::open_read_only(&bare).unwrap().read_collections().unwrap().is_empty());
+        std::fs::remove_file(&bare).unwrap();
     }
 
     #[test]

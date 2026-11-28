@@ -384,6 +384,9 @@ pub(crate) struct Plan<'a> {
     pub(crate) color_editor: bool,
     pub(crate) color_balance: bool,
     pub(crate) layers: Vec<LayerPlan<'a>>,
+    /// Present when the node graph has a parallel or layer mixer on the render
+    /// path; the layers then compose through it instead of in one series.
+    pub(crate) mix: Option<crate::MixPlan>,
 }
 
 /// C1 queue stage 77 on developed output codes: the same kernel the verified

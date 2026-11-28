@@ -571,6 +571,7 @@ impl BandSampler<'_> {
     /// Fills `band` with output rows `y0 .. y0 + rows` (row-major, `out_w` wide).
     /// A band is one tile row tall, so it maps onto whole cached tiles.
     fn band(&self, y0: u32, rows: u32, band: &mut Vec<SourceSample>) {
+        let _sampling = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Sampling);
         let out_w = self.out_w as usize;
         band.resize(rows as usize * out_w, EMPTY_SAMPLE);
         let tiles = self.tiles(y0 / SAMPLE_TILE);
@@ -960,6 +961,80 @@ impl Source {
     }
 }
 
+/// Layers outside `active` whose masks a copy mask in `active` reads,
+/// transitively, in first-reference order.
+fn copy_mask_sources<'a>(adj: &'a AdjustmentSet, active: &[&'a Layer]) -> Vec<&'a Layer> {
+    let mut seen: Vec<u64> = active.iter().map(|layer| layer.id).collect();
+    let mut out: Vec<&Layer> = Vec::new();
+    let mut queue: Vec<&Layer> = active.to_vec();
+    while let Some(layer) = queue.pop() {
+        for shape in &layer.mask.shapes {
+            let MaskShape::Copy { from_layer, .. } = shape else { continue };
+            if seen.contains(from_layer) {
+                continue;
+            }
+            seen.push(*from_layer);
+            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
+                out.push(source);
+                queue.push(source);
+            }
+        }
+    }
+    out
+}
+
+/// Builds layer mask rasters on demand so a copy mask can read any layer's
+/// mask, whatever its draw position. Cycles resolve to an empty source.
+struct MaskResolver<'a> {
+    adj: &'a AdjustmentSet,
+    aspect: f32,
+    cell_px: f32,
+    guide: Option<&'a [f32]>,
+    memo: Vec<(u64, Option<Arc<MaskGrid>>)>,
+    stack: Vec<u64>,
+    /// Set when a cycle was cut below the current layer; such a raster
+    /// depends on where the walk started, so it is not memoized.
+    cut: bool,
+}
+
+impl MaskResolver<'_> {
+    fn grid_for(&mut self, layer: &Layer) -> Option<Arc<MaskGrid>> {
+        if let Some((_, grid)) = self.memo.iter().find(|(id, _)| *id == layer.id) {
+            return grid.clone();
+        }
+        if layer.mask.shapes.is_empty() {
+            return None;
+        }
+        if self.stack.contains(&layer.id) {
+            self.cut = true;
+            return None;
+        }
+        let outer_cut = std::mem::take(&mut self.cut);
+        self.stack.push(layer.id);
+        let mut deps: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
+        for shape in &layer.mask.shapes {
+            let MaskShape::Copy { from_layer, .. } = shape else { continue };
+            if deps.iter().any(|(id, _)| id == from_layer) {
+                continue;
+            }
+            let adj = self.adj;
+            if let Some(source) = adj.layers.iter().find(|l| l.id == *from_layer) {
+                if let Some(grid) = self.grid_for(source) {
+                    deps.push((*from_layer, grid));
+                }
+            }
+        }
+        self.stack.pop();
+        let tainted = self.cut;
+        self.cut = outer_cut || tainted;
+        let grid = Arc::new(MaskGrid::build(&layer.mask, self.aspect, self.cell_px, self.guide, &deps));
+        if !tainted {
+            self.memo.push((layer.id, Some(Arc::clone(&grid))));
+        }
+        Some(grid)
+    }
+}
+
 fn cached_mask_grids(
     src: &Source,
     adj: &AdjustmentSet,
@@ -980,10 +1055,19 @@ fn cached_mask_grids(
         Mutex<Vec<(MaskGridCacheKey, Arc<Vec<Option<Arc<MaskGrid>>>>)>>,
     > =
         OnceLock::new();
+    // A copy mask reads another layer's *mask*, which is data: the source may
+    // sit after the copying layer, be disabled, or be pruned from the render
+    // list, and the copy must still see its shapes. Those sources are part of
+    // the raster's identity, so they join the cache key.
+    let copy_sources = copy_mask_sources(adj, active);
     let key = MaskGridCacheKey {
         source: src.snapshot_id(),
         geometry: adj.geometry.clone(),
-        layers: active.iter().map(|layer| (layer.id, layer.mask.clone())).collect(),
+        layers: active
+            .iter()
+            .chain(copy_sources.iter())
+            .map(|layer| (layer.id, layer.mask.clone()))
+            .collect(),
         has_guide: guide.is_some(),
     };
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -995,15 +1079,18 @@ fn cached_mask_grids(
         return grids;
     }
 
-    let mut built: Vec<(u64, Arc<MaskGrid>)> = Vec::new();
+    let mut resolver = MaskResolver {
+        adj,
+        aspect,
+        cell_px,
+        guide,
+        memo: Vec::new(),
+        stack: Vec::new(),
+        cut: false,
+    };
     let mut grids = Vec::with_capacity(active.len());
     for layer in active {
-        let grid = (!layer.mask.shapes.is_empty())
-            .then(|| Arc::new(MaskGrid::build(&layer.mask, aspect, cell_px, guide, &built)));
-        if let Some(grid) = &grid {
-            built.push((layer.id, Arc::clone(grid)));
-        }
-        grids.push(grid);
+        grids.push(resolver.grid_for(layer));
     }
     let bytes = grids
         .iter()
@@ -1144,7 +1231,7 @@ fn layer_plans<'a>(
 }
 
 fn cached_layer_coverage(
-    plan: &Plan<'_>,
+    plan: &LayerView<'_, '_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
     width: usize,
@@ -1985,6 +2072,7 @@ fn build_plan<'a>(
         color_editor: adj.color_editor != ColorEditor::default(),
         color_balance: adj.color_balance != ColorBalance::default(),
         layers: layer_plans(src, adj, aspect, cell_px, guide, mask_overlay),
+        mix: crate::mix_plan(adj),
     }
 }
 
@@ -2205,6 +2293,7 @@ fn encode_gpu_develop_bands(
     mut rgba16: Option<&mut [u16]>,
 ) -> bool {
     use super::develop_gpu;
+    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -2253,6 +2342,7 @@ fn develop_bands(
     rgba: &mut [u8],
     mut rgba16: Option<&mut [u16]>,
 ) {
+    let _develop = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
     let out_w = bands.out_w;
     let out_h = bands.out_h;
     let row = (out_w * 4) as usize;
@@ -2520,6 +2610,7 @@ fn render_sized(
     want_bgra: bool,
     scopes: ScopeWants,
 ) -> (Rendered, Option<Vec<u16>>) {
+    let _render_total = crate::compute::telemetry::span(crate::compute::telemetry::Stage::RenderTotal);
     let stage_timing = std::env::var_os("AURORA_STAGE_TIMING").is_some();
     let t0 = stage_timing.then(std::time::Instant::now);
     let region = clean_region(region);
@@ -2645,7 +2736,26 @@ fn render_sized(
         #[cfg(not(all(windows, feature = "z6iii-raw-export")))]
         let c1_ok = true;
 
-        if c1_ok {
+        // Preflight against the shared VRAM ledger before the sample array and
+        // the full-frame gain plane exist: a refusal must not first
+        // materialise them. Conservative on the optional buffers (same sizes
+        // the device pool computes in `ResidentNeeds`).
+        let resident_admitted = c1_ok && {
+            let nr_any = !bypass
+                && (adj.noise_reduction.single_pixel > 0.0
+                    || adj.noise_reduction.luminance > 0.0
+                    || adj.noise_reduction.color > 0.0);
+            super::develop_gpu::resident_preview_admits(
+                out_w as usize,
+                out_h as usize,
+                &dev_params,
+                !bypass && (plan.uniform_light.is_some() || adj.vignetting.amount.abs() > 1e-3),
+                !bypass && camera_usm_path,
+                !bypass && !camera_usm_path && f32_includes_sharpen && adj.sharpening.amount > 0.0,
+                nr_any.then_some(&adj.noise_reduction),
+            )
+        };
+        if resident_admitted {
             let post_8bit = has_post_8bit_stages(adj, bypass, &plan, post_portrait);
             let direct_return = !post_8bit;
             let emit_bgra = direct_return && want_bgra;
@@ -2747,6 +2857,7 @@ fn render_sized(
                     }
                 },
             );
+            crate::compute::telemetry::record_decision(resident.is_some(), false);
             if let Some(res) = resident {
                 if let Some(t0) = t0 {
                     eprintln!(
@@ -2861,7 +2972,9 @@ fn render_sized(
                     if !adj.retouch.is_empty() {
                         apply_retouch(&mut rgba, out_w, out_h, adj, &map, region, scale);
                     }
+                    let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
                     apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
+                    drop(layers_span);
                 }
                 break 'develop (rgba, rgba16, develop8);
             }
@@ -3075,6 +3188,7 @@ fn render_sized(
         };
         let work_w = out_w as usize + 2 * halo;
         let work_h = out_h as usize + 2 * halo;
+        let develop_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Develop);
         let mut rgb_f32 = take_f32_frame(work_w * work_h);
         let mut gpu_filled = false;
         // L3 stage cache: the develop frame before detail. The key holds the
@@ -3175,6 +3289,9 @@ fn render_sized(
                 }
             }
         }
+        if !stage_cached {
+            crate::compute::telemetry::record_decision(gpu_filled, false);
+        }
         if !stage_cached && !gpu_filled {
         if halo != 0 {
             // Preserve the viewport's sample centers and fetch neighbors in the
@@ -3264,6 +3381,7 @@ fn render_sized(
                 else { develop_display(&plan, c1.apply_camera_icc(*rgb)).map(|v| v.clamp(0.0, 1.0)) };
             });
         }
+        drop(develop_span);
         super::detail::post_process_core_f32(
             &mut rgb_f32, work_w as u32, work_h as u32, adj, scale, sharpen_in_display,
         );
@@ -3317,6 +3435,7 @@ fn render_sized(
         };
         #[cfg(not(windows))]
         let gpu_done = false;
+        crate::compute::telemetry::record_decision(gpu_done, false);
         if !gpu_done {
             develop_bands(&plan, &bands, bypass, pre.as_ref(), &mut rgba, rgba16.as_deref_mut());
         }
@@ -3511,7 +3630,9 @@ fn render_sized(
     // Layers come last: the spot removal sees the developed frame, and the
     // layer mix sees the healed one.
     if !bypass {
+        let layers_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::LayersMasks);
         apply_layers(&mut rgba, out_w, out_h, &plan, &map, region, scale, src.size());
+        drop(layers_span);
     }
         (rgba, rgba16, develop8)
     };
@@ -3981,6 +4102,7 @@ fn render_sized(
         if let Some(producer) = producer_inputs.as_ref() {
             inputs.fill_from_producer_inputs(producer);
         }
+        let _portrait = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
         Some(crate::portrait_stage::apply_portrait_colors_before_body(
             &mut rgba,
             out_w,
@@ -4005,9 +4127,11 @@ fn render_sized(
                 Some(src.portrait_masks_receipt_fingerprint()),
             ).job_id()
         });
+        let portrait_body_span = crate::compute::telemetry::span(crate::compute::telemetry::Stage::Portrait);
         let body = crate::portrait_stage::apply_live_body(
             &mut rgba, rgba16.as_deref_mut(), (out_w, out_h), job_id, &adj.extra,
         );
+        drop(portrait_body_span);
         if !body.is_empty() {
             let report = portrait_report.get_or_insert_with(|| crate::PortraitRunReport {
                 job_id: Some(job_id), ..Default::default()
@@ -4882,6 +5006,38 @@ fn apply_layers(
     if plan.layers.is_empty() {
         return;
     }
+    if let Some(mix) = &plan.mix {
+        apply_mixed(rgba, width, height, plan, mix, map, region, scale, source_size);
+        return;
+    }
+    let view = LayerView {
+        adj: plan.adj,
+        source: plan.source,
+        layers: plan.layers.iter().collect(),
+    };
+    apply_layer_set(rgba, width, height, &view, map, region, scale, source_size);
+}
+
+/// The layers one pass applies in series, and what their caches key on.
+struct LayerView<'p, 'a> {
+    adj: &'a AdjustmentSet,
+    source: u64,
+    layers: Vec<&'p LayerPlan<'a>>,
+}
+
+fn apply_layer_set(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    plan: &LayerView<'_, '_>,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    scale: f32,
+    source_size: (u32, u32),
+) {
+    if plan.layers.is_empty() {
+        return;
+    }
     // Heal/clone layers repair the pixels before their own colour edits stack.
     for lp in &plan.layers {
         if !lp.layer.cover.is_empty() {
@@ -5068,6 +5224,171 @@ fn apply_layers(
     }
 }
 
+/// Renders a graph with mixers on the CPU frame: every `MixStep` produces an
+/// image, and a `Chain` is the ordinary serial pass over just its layers, so a
+/// chain behaves exactly like the same layers in a serial graph. Preview,
+/// export and thumbnails all reach this through `apply_layers`.
+fn apply_mixed(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    plan: &Plan,
+    mix: &crate::MixPlan,
+    map: &super::geometry::FrameMap,
+    region: NormRect,
+    scale: f32,
+    source_size: (u32, u32),
+) {
+    use crate::MixStep;
+    use std::collections::HashMap;
+    let w = width as usize;
+    let h = height as usize;
+    let xs: Vec<f32> =
+        (0..w).map(|x| region.x + (x as f32 + 0.5) / w as f32 * region.width).collect();
+    let base: Vec<u8> = rgba.to_vec();
+    let mut values: HashMap<u64, Vec<u8>> = HashMap::new();
+    // A node nothing produced (the input, or a bypassed feeder) is the base.
+    fn value<'v>(values: &'v HashMap<u64, Vec<u8>>, base: &'v [u8], id: u64) -> &'v [u8] {
+        values.get(&id).map_or(base, |v| v.as_slice())
+    }
+    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
+    for step in &mix.steps {
+        match step {
+            MixStep::Chain { layers, from, to } => {
+                let mut frame = value(&values, &base, *from).to_vec();
+                let view = LayerView {
+                    adj: plan.adj,
+                    source: plan.source,
+                    layers: layers.iter().filter_map(|id| find(*id)).collect(),
+                };
+                apply_layer_set(&mut frame, width, height, &view, map, region, scale, source_size);
+                values.insert(*to, frame);
+            }
+            MixStep::Parallel { node, reference, inputs } => {
+                let reference = value(&values, &base, *reference);
+                let branches: Vec<&[u8]> =
+                    inputs.iter().map(|id| value(&values, &base, *id)).collect();
+                let mut out = reference.to_vec();
+                out.par_chunks_mut(4).enumerate().for_each(|(i, px)| {
+                    for k in 0..3 {
+                        let r = reference[i * 4 + k] as i32;
+                        let sum: i32 = branches.iter().map(|b| b[i * 4 + k] as i32 - r).sum();
+                        px[k] = (r + sum).clamp(0, 255) as u8;
+                    }
+                });
+                values.insert(*node, out);
+            }
+            MixStep::Stack { node, inputs } => {
+                let Some(first) = inputs.first() else {
+                    values.insert(*node, base.clone());
+                    continue;
+                };
+                let mut out = value(&values, &base, first.source).to_vec();
+                for input in &inputs[1..] {
+                    let top = value(&values, &base, input.source);
+                    let origin = value(&values, &base, input.origin);
+                    let covering: Vec<&LayerPlan> =
+                        input.layers.iter().filter_map(|id| find(*id)).collect();
+                    let opaque = input.layers.is_empty();
+                    out.par_chunks_mut(w * 4).enumerate().for_each(|(y, line)| {
+                        let fy = region.y + (y as f32 + 0.5) / h as f32 * region.height;
+                        for x in 0..w {
+                            let i = (y * w + x) * 4;
+                            let c = if opaque {
+                                1.0
+                            } else {
+                                let g = [
+                                    origin[i] as f32 / 255.0,
+                                    origin[i + 1] as f32 / 255.0,
+                                    origin[i + 2] as f32 / 255.0,
+                                ];
+                                let p = map.map([xs[x], fy]).0;
+                                1.0 - covering
+                                    .iter()
+                                    .map(|lp| 1.0 - layer_weight(lp, p, g).clamp(0.0, 1.0))
+                                    .product::<f32>()
+                            };
+                            for k in 0..3 {
+                                let below = line[x * 4 + k] as f32;
+                                let v = top[i + k] as f32
+                                    + (1.0 - c) * (below - origin[i + k] as f32);
+                                line[x * 4 + k] = v.clamp(0.0, 255.0).round() as u8;
+                            }
+                        }
+                    });
+                }
+                values.insert(*node, out);
+            }
+        }
+    }
+    let result = value(&values, &base, mix.output);
+    rgba.par_chunks_mut(4).zip(result.par_chunks(4)).for_each(|(dst, src)| {
+        dst[..3].copy_from_slice(&src[..3]);
+    });
+}
+
+/// The picker's version of [`apply_mixed`]: one colour through the same
+/// steps, so a sampled point agrees with the frame (colour operators only; the
+/// spatial ones need neighbours).
+fn mix_pixel(plan: &Plan, mix: &crate::MixPlan, p: [f32; 2], base: [f32; 3]) -> [f32; 3] {
+    use crate::MixStep;
+    use std::collections::HashMap;
+    let mut values: HashMap<u64, [f32; 3]> = HashMap::new();
+    let find = |id: u64| plan.layers.iter().find(|lp| lp.layer.id == id);
+    let get = |values: &HashMap<u64, [f32; 3]>, id: u64| values.get(&id).copied().unwrap_or(base);
+    for step in &mix.steps {
+        match step {
+            MixStep::Chain { layers, from, to } => {
+                let mut g = get(&values, *from);
+                for lp in layers.iter().filter_map(|id| find(*id)) {
+                    let m = layer_weight(lp, p, g);
+                    if m > 1e-4 {
+                        g = layer_pixel(lp, g, m);
+                    }
+                }
+                values.insert(*to, g);
+            }
+            MixStep::Parallel { node, reference, inputs } => {
+                let r = get(&values, *reference);
+                let mut out = r;
+                for id in inputs {
+                    let b = get(&values, *id);
+                    for k in 0..3 {
+                        out[k] += b[k] - r[k];
+                    }
+                }
+                values.insert(*node, out);
+            }
+            MixStep::Stack { node, inputs } => {
+                let Some(first) = inputs.first() else {
+                    values.insert(*node, base);
+                    continue;
+                };
+                let mut out = get(&values, first.source);
+                for input in &inputs[1..] {
+                    let top = get(&values, input.source);
+                    let origin = get(&values, input.origin);
+                    let c = if input.layers.is_empty() {
+                        1.0
+                    } else {
+                        1.0 - input
+                            .layers
+                            .iter()
+                            .filter_map(|id| find(*id))
+                            .map(|lp| 1.0 - layer_weight(lp, p, origin).clamp(0.0, 1.0))
+                            .product::<f32>()
+                    };
+                    for k in 0..3 {
+                        out[k] = top[k] + (1.0 - c) * (out[k] - origin[k]);
+                    }
+                }
+                values.insert(*node, out);
+            }
+        }
+    }
+    get(&values, mix.output)
+}
+
 fn static_mask_can_apply(lp: &LayerPlan<'_>) -> bool {
     if lp.opacity <= 1e-4 {
         return false;
@@ -5087,7 +5408,7 @@ fn apply_layer_color_row(
     static_weights: Option<&[f32]>,
     recorded_weights: Option<&mut [f32]>,
     n: usize,
-    plan: &Plan,
+    plan: &LayerView<'_, '_>,
     map: &super::geometry::FrameMap,
     region: NormRect,
     xs: &[f32],
@@ -5146,6 +5467,9 @@ fn render_single(src: &Source, adj: &AdjustmentSet, p: [f32; 2], s: [f32; 2], f:
     };
     // The colour stack of the layers applies to the picked point too; the
     // spatial operators need neighbours, so they only run on a full frame.
+    if let Some(mix) = &plan.mix {
+        return mix_pixel(&plan, mix, p, g);
+    }
     for lp in &plan.layers {
         let m = layer_weight(lp, p, g);
         if m <= 1e-4 {
@@ -7703,6 +8027,56 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert!(blank.data.iter().all(|v| *v == 0.0), "an unknown source adds nothing");
     }
 
+    /// The render path builds rasters for the enabled layers only, in draw
+    /// order. A copy mask must still read a source that is disabled or sits
+    /// after it, and a copy cycle must not recurse forever.
+    #[test]
+    fn copy_mask_reads_disabled_and_later_sources() {
+        let src = Source::from_rgba(64, 48, &synthetic(64, 48));
+        let aspect = 4.0 / 3.0;
+        let disc = Mask { shapes: vec![stroke(MaskOp::Add, [0.5, 0.5], 0.3)], ..Default::default() };
+        let copy = |from: u64| Mask {
+            shapes: vec![MaskShape::Copy { from_layer: from, op: MaskOp::Add }],
+            ..Default::default()
+        };
+        let layer = |id: u64, enabled: bool, mask: Mask| Layer {
+            id,
+            enabled,
+            opacity: 100.0,
+            mask,
+            ..Default::default()
+        };
+        let reference = MaskGrid::build(&disc, aspect, 4.0, None, &[]);
+
+        // 1 copies the disabled 2; 3 copies 4, which is drawn after it.
+        let mut adj = AdjustmentSet::default();
+        adj.layers.push(layer(1, true, copy(2)));
+        adj.layers.push(layer(2, false, disc.clone()));
+        adj.layers.push(layer(3, true, copy(4)));
+        adj.layers.push(layer(4, true, disc.clone()));
+        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
+        let grids = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
+        assert_eq!(grids[0].as_ref().expect("copy of disabled layer").data, reference.data);
+        assert_eq!(grids[1].as_ref().expect("copy of later layer").data, reference.data);
+
+        // Editing the disabled source changes the copy: it is part of the key.
+        adj.layers[1].mask = Mask::default();
+        let active: Vec<&Layer> = adj.layers.iter().filter(|l| l.enabled).collect();
+        let edited = cached_mask_grids(&src, &adj, &active, aspect, 4.0, None);
+        assert!(edited[0].as_ref().unwrap().data.iter().all(|v| *v == 0.0));
+
+        // 5 and 6 copy each other: both resolve, the inner reference is empty.
+        let mut cyc = AdjustmentSet::default();
+        let mut a = copy(6);
+        a.shapes.push(stroke(MaskOp::Add, [0.5, 0.5], 0.3));
+        cyc.layers.push(layer(5, true, a));
+        cyc.layers.push(layer(6, true, copy(5)));
+        let active: Vec<&Layer> = cyc.layers.iter().collect();
+        let grids = cached_mask_grids(&src, &cyc, &active, aspect, 4.0, None);
+        assert_eq!(grids[0].as_ref().unwrap().data, reference.data);
+        assert_eq!(grids[1].as_ref().unwrap().data, reference.data);
+    }
+
     // ───────────────────────────── layers ─────────────────────────────
 
     fn tone_layer(id: u64, exposure: f32, brightness: f32) -> Layer {
@@ -7805,6 +8179,115 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let mut reversed = forward.clone();
         reversed.layers = vec![tone_layer(2, 0.0, 30.0), tone_layer(1, 0.8, 0.0)];
         assert_ne!(graphed, render(&src, &reversed, NormRect::FULL, w, false, None).rgba);
+    }
+
+    /// INPUT feeds both layers; `mixer` takes layer 1 on input 0 and layer 2 on
+    /// input 1, and feeds the output.
+    fn mixer_graph(kind: crate::NodeKind) -> crate::NodeGraph {
+        let mut graph = graph_of(&[1, 2], &[]);
+        graph.links.clear();
+        graph.nodes.push(crate::GraphNode { id: 10, kind, pos: [0.0; 2] });
+        let link = |from, to, input| crate::NodeLink { from, to, input };
+        graph.links = vec![
+            link(crate::NodeGraph::INPUT, 1, 0),
+            link(crate::NodeGraph::INPUT, 2, 0),
+            link(1, 10, 0),
+            link(2, 10, 1),
+            link(10, crate::NodeGraph::OUTPUT, 0),
+        ];
+        graph
+    }
+
+    fn first_pixel(rgba: &[u8], x: usize) -> [i32; 3] {
+        [rgba[x * 4] as i32, rgba[x * 4 + 1] as i32, rgba[x * 4 + 2] as i32]
+    }
+
+    /// Two parallel branches grade the same input: the result is the input
+    /// plus both branches' deltas, which a serial chain does not produce.
+    #[test]
+    fn parallel_mixer_sums_branch_deltas_from_the_shared_input() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
+            let mut adj = AdjustmentSet::default();
+            adj.layers = layers;
+            adj.nodes = nodes;
+            render(&src, &adj, NormRect::FULL, w, false, None).rgba
+        };
+        let a_layer = tone_layer(1, 0.8, 0.0);
+        let b_layer = tone_layer(2, -0.5, 0.0);
+        let base = first_pixel(&render_with(vec![], None), 0);
+        let a = first_pixel(&render_with(vec![a_layer.clone()], None), 0);
+        let b = first_pixel(&render_with(vec![b_layer.clone()], None), 0);
+        let parallel = render_with(
+            vec![a_layer.clone(), b_layer.clone()],
+            Some(mixer_graph(crate::NodeKind::Parallel)),
+        );
+        let got = first_pixel(&parallel, 0);
+        for k in 0..3 {
+            let want = (base[k] + (a[k] - base[k]) + (b[k] - base[k])).clamp(0, 255);
+            assert!((got[k] - want).abs() <= 1, "channel {k}: got {got:?}, want {want}");
+        }
+        assert_ne!(a, b, "the branches must differ for this test to mean anything");
+
+        let serial = render_with(vec![a_layer, b_layer], Some(graph_of(&[1, 2], &[1, 2])));
+        assert_ne!(parallel, serial, "parallel branches are not a serial chain");
+    }
+
+    /// A parallel mixer with one branch is that branch, byte for byte, and the
+    /// picker agrees with the frame.
+    #[test]
+    fn a_single_parallel_branch_equals_the_branch() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let mut one = AdjustmentSet::default();
+        one.layers = vec![tone_layer(1, 0.8, 0.0)];
+        let mut graph = mixer_graph(crate::NodeKind::Parallel);
+        graph.links.retain(|l| l.from != 2 && l.to != 2);
+        graph.nodes.retain(|n| n.id != 2);
+        let mut mixed = one.clone();
+        mixed.nodes = Some(graph);
+        assert!(crate::mix_plan(&mixed).is_some());
+        assert_eq!(
+            render(&src, &one, NormRect::FULL, w, false, None).rgba,
+            render(&src, &mixed, NormRect::FULL, w, false, None).rgba
+        );
+    }
+
+    /// The top input of a layer mixer replaces what is below it only where its
+    /// mask covers; elsewhere the lower input shows.
+    #[test]
+    fn layer_mixer_stacks_the_higher_input_over_the_lower_by_its_mask() {
+        let (w, h) = (16u32, 16u32);
+        let src = Source::from_rgba(w, h, &flat(w, h, 110));
+        let bottom = tone_layer(1, 0.8, 0.0);
+        let mut top = tone_layer(2, -1.0, 0.0);
+        top.mask = left_half_raster(0.0);
+        let render_with = |layers: Vec<Layer>, nodes: Option<crate::NodeGraph>| {
+            let mut adj = AdjustmentSet::default();
+            adj.layers = layers;
+            adj.nodes = nodes;
+            render(&src, &adj, NormRect::FULL, w, false, None).rgba
+        };
+        let stacked = render_with(
+            vec![bottom.clone(), top.clone()],
+            Some(mixer_graph(crate::NodeKind::LayerMixer)),
+        );
+        let only_bottom = render_with(vec![bottom], None);
+        let only_top = render_with(vec![top], None);
+        // Inside the top mask only the top input shows; outside, the bottom.
+        assert_eq!(first_pixel(&stacked, 2), first_pixel(&only_top, 2));
+        assert_eq!(first_pixel(&stacked, 13), first_pixel(&only_bottom, 13));
+        assert_ne!(first_pixel(&only_top, 2), first_pixel(&only_bottom, 2));
+    }
+
+    /// A graph without mixers keeps the flat serial path.
+    #[test]
+    fn serial_graphs_have_no_mix_plan() {
+        let mut adj = AdjustmentSet::default();
+        adj.layers = vec![tone_layer(1, 0.8, 0.0), tone_layer(2, 0.0, 30.0)];
+        adj.nodes = Some(graph_of(&[1, 2], &[1, 2]));
+        assert!(crate::mix_plan(&adj).is_none());
     }
 
     /// A layer with a curve and a hard-edged mask on the left half.
@@ -7999,9 +8482,10 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         assert_eq!(ColorBand::default().value_high, 1.0);
     }
 
-    /// Tightening the value band must keep dark and bright pixels untouched.
+    /// C1 has no value selection band (`HueBandWeight * ChromaBandWeight`):
+    /// a tightened `value_low/high` is carried but must not gate the edit.
     #[test]
-    fn tightened_value_band_only_edits_its_window() {
+    fn value_band_does_not_gate_the_edit() {
         let mut ce = ColorEditor::default();
         let band = &mut ce.bands[HueSector::Red as usize];
         band.hue_low = -25.0;
@@ -8019,9 +8503,9 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         let dark = hsv_to_rgb(0.0, 1.0, 0.1);
         let bright = hsv_to_rgb(0.0, 1.0, 0.95);
         let shift = |p: [f32; 3]| signed_hue_delta(hue_of(color_editor(p, &ce, 1.0)), 0.0);
-        assert!(shift(mid) > 20.0, "midtone must still shift: {}", shift(mid));
-        assert!(shift(dark).abs() < 1e-3, "dark pixel moved: {}", shift(dark));
-        assert!(shift(bright).abs() < 1e-3, "bright pixel moved: {}", shift(bright));
+        assert!(shift(mid) > 20.0, "midtone must shift: {}", shift(mid));
+        assert!((shift(dark) - shift(mid)).abs() < 1e-3, "value band gated dark: {}", shift(dark));
+        assert!((shift(bright) - shift(mid)).abs() < 1e-3, "value band gated bright: {}", shift(bright));
     }
 
     fn narrow_bands(ce: &mut ColorEditor) {
@@ -8169,10 +8653,11 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
         }
     }
 
-    /// Homogeneity lightness pulls V toward the selected color's value on the
-    /// skin list, and is ignored by every other list.
+    /// Homogeneity lightness damps V toward the selected color's value on the
+    /// skin list with C1's asymmetric quadratic step (it does not collapse the
+    /// spread in one pass), and is ignored by every other list.
     #[test]
-    fn lightness_homogeneity_converges_on_skin_only() {
+    fn lightness_homogeneity_damps_skin_only() {
         let band = ColorBand {
             center_hue: 0.0,
             center_saturation: 0.75,
@@ -8190,11 +8675,14 @@ half_amount	10	20	0	0	1	0.5	1	soft	0	0	2	2	2
 
         let dark = hsv_to_rgb(0.0, 0.75, 0.3);
         let light = hsv_to_rgb(0.0, 0.75, 0.95);
-        let before = (rgb_to_hsv(dark).2 - rgb_to_hsv(light).2).abs();
-        let after = (rgb_to_hsv(color_editor(dark, &ce, 1.0)).2
-            - rgb_to_hsv(color_editor(light, &ce, 1.0)).2)
-            .abs();
-        assert!(after < before * 0.01, "skin V did not converge: {before} -> {after}");
+        let (dark_v, light_v) = (rgb_to_hsv(dark).2, rgb_to_hsv(light).2);
+        let dark_out = rgb_to_hsv(color_editor(dark, &ce, 1.0)).2;
+        let light_out = rgb_to_hsv(color_editor(light, &ce, 1.0)).2;
+        assert!(dark_out > dark_v + 0.005, "dark skin not lifted: {dark_v} -> {dark_out}");
+        assert!(light_out < light_v - 0.005, "light skin not lowered: {light_v} -> {light_out}");
+        // C1 step at u = 100, L 30 -> target 80: q = 0.375, (1 - q/4)^2 = 0.8213,
+        // dl = +8.936, V' = 0.3 * (1 + 0.08936 * 0.5 * 0.75) = 0.31005.
+        assert!((dark_out - 0.31005).abs() < 2e-4, "dark {dark_out} vs C1 0.31005");
 
         // The same band on another list must not move the pixel at all.
         for list in 0..2 {

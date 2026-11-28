@@ -304,18 +304,14 @@ fn estimated_decode_bytes(width: u32, height: u32, format: DecodeFormat) -> usiz
     retained.saturating_add(transient)
 }
 
-/// Which RAW decoder the route selects, for the *observed* working-set
-/// estimate. Deliberately separate from [`DecodeFormat`]: it does not feed
-/// admission until real peak-RSS data lands.
+/// Which RAW decoder the route selects, for the working-set estimate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum RawDecodeShape {
     LibRaw,
     AuroraGeneric,
     AuroraZ6iii,
 }
 
-#[allow(dead_code)]
 impl RawDecodeShape {
     fn of(route: &crate::raw::DecodeRoute) -> Self {
         if !route.c1_raw_enabled {
@@ -345,13 +341,11 @@ impl RawDecodeShape {
 }
 
 /// Working set a decode is expected to hold, including the container bytes and
-/// the per-backend buffers the 12/16 B/px admission constants omit.
+/// the per-backend buffers the 12/16 B/px constants omit.
 ///
-/// **Estimation only.** Admission still uses [`estimated_decode_bytes`] with
-/// its unchanged constants; switching the gate to this value needs real
-/// peak-RSS measurements per format (Z6III HE/HE★, lossless NEF, ARW, CR3,
-/// RAF, DNG).
-#[allow(dead_code)]
+/// The B/px values are estimates from the buffer lists in
+/// [`RawDecodeShape::transient_bytes_per_px`], not measured peak RSS (Z6III
+/// HE/HE*, lossless NEF, ARW, CR3, RAF, DNG still need measuring on Windows).
 fn estimated_decode_bytes_observed(
     width: u32,
     height: u32,
@@ -376,6 +370,51 @@ fn estimated_decode_bytes_observed(
     file_bytes
         .saturating_add(retained)
         .saturating_add(source_px.saturating_mul(per_px))
+}
+
+/// The pixel grid the decoder actually walks: the catalog's (oriented, possibly
+/// cropped) size or the RAW sensor grid, whichever is larger. Sensor sizes
+/// include margin pixels that `ImageInfo` never reports.
+fn decode_admission_dims(info: (u32, u32), sensor: Option<(u32, u32)>) -> (u32, u32) {
+    let px = |d: (u32, u32)| u64::from(d.0) * u64::from(d.1);
+    match sensor {
+        Some(s) if px(s) > px(info) => s,
+        _ => info,
+    }
+}
+
+/// Bytes the decode gate charges for one decode. Never below
+/// [`estimated_decode_bytes`] (so existing admission and the export-budget
+/// calibration are a floor); for RAW it additionally counts the sensor grid,
+/// the container bytes held while decoding and the per-backend decoder buffers.
+fn decode_admission_bytes(
+    info: (u32, u32),
+    sensor: Option<(u32, u32)>,
+    format: DecodeFormat,
+    file_bytes: usize,
+    route: Option<&crate::raw::DecodeRoute>,
+) -> usize {
+    let base = estimated_decode_bytes(info.0, info.1, format);
+    let (w, h) = decode_admission_dims(info, sensor);
+    match (format, route) {
+        (DecodeFormat::RawProxy | DecodeFormat::RawNative, Some(route)) => {
+            estimated_decode_bytes_observed(w, h, format, file_bytes, route).max(base)
+        }
+        _ => estimated_decode_bytes(w, h, format).max(base),
+    }
+}
+
+/// Sensor grid, container size and decode route for a RAW path. Empty for EIP
+/// (the RAW sits inside a ZIP) and non-RAW files.
+fn raw_admission_inputs(path: &Path) -> (Option<(u32, u32)>, usize, Option<crate::raw::DecodeRoute>) {
+    if !crate::raw::is_raw(path) || is_eip(path) {
+        return (None, 0, None);
+    }
+    let sensor = crate::raw::sensor_dimensions(path);
+    let file_bytes = std::fs::metadata(path)
+        .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+        .unwrap_or(0);
+    (sensor, file_bytes, Some(crate::raw::decode_route(path)))
 }
 
 /// Decode-format class for a proxy decode of `path`; native RAW decodes pass
@@ -2667,6 +2706,18 @@ impl FileEngine {
         materialize_eip(&self.root, &path).ok()
     }
 
+    /// Opens any supported catalog read-only: a Lightroom Classic `.lrcat`
+    /// through [`FileEngine::open_lrcat`], everything else (Capture One
+    /// catalogs and sessions) through [`FileEngine::open_c1_catalog`].
+    pub fn open_catalog(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lrcat")) {
+            Self::open_lrcat(path)
+        } else {
+            Self::open_c1_catalog(path)
+        }
+    }
+
     /// Opens a Capture One catalog or session read-only and imports its images
     /// as Portrait entries. Edits are saved to `.portrait` beside the database; the C1
     /// database itself is never written to.
@@ -2744,6 +2795,65 @@ impl FileEngine {
         };
         engine.import_c1(&import);
         engine.inference().preload_ai_masks();
+        Ok(engine)
+    }
+
+    /// Opens a Lightroom Classic `.lrcat` read-only. The catalog is only read
+    /// (`SQLITE_OPEN_READ_ONLY`); the photos it references are opened as a
+    /// folder library rooted at their deepest common folder, and Lightroom's
+    /// rating, colour label and develop settings seed every image that has no
+    /// edits of its own yet. Edits are saved to `.portrait` beside the photos.
+    pub fn open_lrcat(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let catalog = crate::lrcat_import::LrcatCatalog::open_read_only(path.as_ref())?;
+        let records: Vec<_> = catalog.read_images()?.into_iter().filter(|r| r.file_path.is_file()).collect();
+        anyhow::ensure!(!records.is_empty(), "the Lightroom catalog references no photo that exists on this machine");
+        let mut root = records[0].file_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for record in &records[1..] {
+            while !record.file_path.starts_with(&root) {
+                if !root.pop() {
+                    break;
+                }
+            }
+        }
+        anyhow::ensure!(
+            root.components().count() >= 2 && root.is_dir(),
+            "the Lightroom catalog's photos share no common folder"
+        );
+        let engine = Self::open(&root)?;
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let by_path: HashMap<PathBuf, &crate::lrcat_import::LrcatImageRecord> =
+            records.iter().map(|r| (canonical(&r.file_path), r)).collect();
+        let mut infos = Vec::new();
+        let mut edits = Vec::new();
+        for mut info in engine.images() {
+            let Some(record) = by_path.get(&canonical(&info.path)) else { continue };
+            if info.rating == 0 && info.color_tag == ColorTag::None && !info.has_adjustments {
+                info.rating = record.rating.clamp(0, 5);
+                info.color_tag = match record.color_label.to_ascii_lowercase().as_str() {
+                    "red" => ColorTag::Red,
+                    "yellow" => ColorTag::Yellow,
+                    "green" => ColorTag::Green,
+                    "blue" => ColorTag::Blue,
+                    "purple" => ColorTag::Purple,
+                    _ => ColorTag::None,
+                };
+                infos.push(info.clone());
+            }
+            if !info.has_adjustments {
+                if let Some(settings) = &record.develop_settings {
+                    let adjustments = settings.to_adjustment_set();
+                    if !adjustments.is_default() {
+                        edits.push((info.id, adjustments));
+                    }
+                }
+            }
+        }
+        if !infos.is_empty() {
+            engine.update_info_batch(&infos)?;
+        }
+        if !edits.is_empty() {
+            engine.save_adjustments_batch(&edits)?;
+        }
         Ok(engine)
     }
 
@@ -3276,7 +3386,14 @@ impl FileEngine {
                     st.source_cache.current_bytes = st.source_cache.current_bytes.saturating_sub(previous.bytes);
                 }
             }
-            let units = decode_units(estimated_decode_bytes(width, height, DecodeFormat::RawNative));
+            let (sensor, file_bytes, route) = raw_admission_inputs(&path);
+            let units = decode_units(decode_admission_bytes(
+                (width, height),
+                sensor,
+                DecodeFormat::RawNative,
+                file_bytes,
+                route.as_ref(),
+            ));
             let _permit = self.decode_gates.heavy.acquire(DecodePriority::Interactive, units);
             self.state.lock().source_cache.misses += 1;
             let decoded = (|| {
@@ -4813,13 +4930,33 @@ impl ImageEngine for FileEngine {
     }
 
     fn import_style(&self, path: &Path) -> anyhow::Result<StyleInfo> {
-        let style = crate::c1_styles::load_style(path)?;
-        let info = StyleInfo {
-            name: style.name,
-            group: "Imported".into(),
-            adjustments: style.adjustments,
-            source: Some(path.to_path_buf()),
-            has_look: style.look.is_some(),
+        let is_xmp = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp"));
+        let info = if is_xmp {
+            // Lightroom / Camera Raw develop preset: read-only, mapped onto
+            // Aurora's own adjustments.
+            let preset = crate::xmp_preset::XmpPreset::load(path)?;
+            let name = preset
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "Lightroom preset".into());
+            StyleInfo {
+                name,
+                group: "Imported".into(),
+                adjustments: preset.to_adjustment_set(),
+                source: Some(path.to_path_buf()),
+                has_look: false,
+            }
+        } else {
+            let style = crate::c1_styles::load_style(path)?;
+            StyleInfo {
+                name: style.name,
+                group: "Imported".into(),
+                adjustments: style.adjustments,
+                source: Some(path.to_path_buf()),
+                has_look: style.look.is_some(),
+            }
         };
         let mut imported = self.imported_styles.write();
         imported.retain(|s| !(s.group == info.group && s.name == info.name));
@@ -5722,6 +5859,64 @@ mod tests {
     }
 
     #[test]
+    fn a_lightroom_catalog_opens_read_only_and_seeds_rating_and_edits() {
+        let dir = std::env::temp_dir().join(format!("portrait-open-lrcat-{}", std::process::id()));
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        image::RgbImage::from_pixel(8, 8, image::Rgb([90, 120, 150])).save(photos.join("a.png")).unwrap();
+        let catalog_path = dir.join("Synthetic.lrcat");
+        {
+            let conn = rusqlite::Connection::open(&catalog_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE AgLibraryRootFolder (id_local INTEGER PRIMARY KEY, absolutePath TEXT, relativePathFromCatalog TEXT, name TEXT);
+                 CREATE TABLE AgLibraryFolder (id_local INTEGER PRIMARY KEY, rootFolder INTEGER, pathFromRoot TEXT);
+                 CREATE TABLE AgLibraryFile (id_local INTEGER PRIMARY KEY, folder INTEGER, baseName TEXT, extension TEXT, idx_filename TEXT);
+                 CREATE TABLE Adobe_images (id_local INTEGER PRIMARY KEY, rootFile INTEGER, rating REAL, colorLabels TEXT, pick REAL, captureTime TEXT, fileFormat TEXT);
+                 CREATE TABLE Adobe_imageDevelopSettings (id_local INTEGER PRIMARY KEY, image INTEGER, text TEXT);
+                 INSERT INTO AgLibraryFolder (id_local, rootFolder, pathFromRoot) VALUES (10, 1, '');
+                 INSERT INTO AgLibraryFile VALUES (100, 10, 'a', 'png', 'a.png');
+                 INSERT INTO Adobe_images VALUES (1000, 100, 4.0, 'Red', 0.0, NULL, 'PNG');",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO AgLibraryRootFolder VALUES (1, ?1, NULL, 'photos')", [photos.to_string_lossy().to_string()]).unwrap();
+            conn.execute(
+                "INSERT INTO Adobe_imageDevelopSettings VALUES (1, 1000, ?1)",
+                ["s = {\n Exposure2012 = 0.5,\n}"],
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(&catalog_path).unwrap();
+        let engine = FileEngine::open_lrcat(&catalog_path).unwrap();
+        let images = engine.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].rating, 4);
+        assert_eq!(images[0].color_tag, ColorTag::Red);
+        assert!(!engine.load_adjustments(images[0].id).is_default());
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), before, "the .lrcat is never modified");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_xmp_preset_imports_as_a_style() {
+        let dir = std::env::temp_dir().join(format!("portrait-import-xmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let preset = dir.join("Warm.xmp");
+        std::fs::write(
+            &preset,
+            br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Exposure2012="+0.50"/></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&preset).unwrap();
+        let engine = FileEngine::open(&dir).unwrap();
+        let style = engine.import_style(&preset).unwrap();
+        assert_eq!(style.name, "Warm");
+        assert!(!style.adjustments.is_default());
+        assert!(engine.styles().iter().any(|s| s.name == "Warm"));
+        assert_eq!(std::fs::read(&preset).unwrap(), before, "source preset untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn an_imported_style_appears_once_in_styles() {
         let dir = std::env::temp_dir().join(format!("portrait-import-style-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6527,6 +6722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn a_tiff_still_in_the_camera_colour_space_gets_the_camera_profile() {
         let dir = icc_temp_dir("tiff-camera");
         let path = dir.join("cam.tif");
@@ -6589,6 +6785,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "external-fixtures"), ignore = "needs Capture One coreConfig/ICC profiles in crates/engine/testdata/ (enable --features external-fixtures)")]
     fn raw_files_still_get_their_camera_defaults() {
         let dir = icc_temp_dir("raw");
         let tiff_path = dir.join("shot.tif");
@@ -7874,6 +8071,54 @@ mod tests {
     }
 
     #[test]
+    fn decode_admission_counts_sensor_grid_file_bytes_and_decoder_buffers() {
+        let route = crate::raw::DecodeRoute {
+            pipeline_fingerprint: 0,
+            c1_raw_enabled: false,
+            z6iii_nef: false,
+            z6iii_feature: false,
+            libraw_available: true,
+            opencl: crate::raw::OpenClRouteState::NotCompiled,
+            device_policy: crate::raw::RawDevicePolicy::default(),
+            demosaic: 3,
+        };
+        // Catalog reports a cropped 6000x4000 frame; the sensor grid is larger.
+        let info = (6000u32, 4000u32);
+        let sensor = (6064u32, 4040u32);
+        assert_eq!(decode_admission_dims(info, Some(sensor)), sensor);
+        // A smaller or missing sensor answer never shrinks the charge.
+        assert_eq!(decode_admission_dims(info, Some((100, 100))), info);
+        assert_eq!(decode_admission_dims(info, None), info);
+
+        let file_bytes = 40_000_000usize;
+        let floor = estimated_decode_bytes(info.0, info.1, DecodeFormat::RawProxy);
+        let admitted = decode_admission_bytes(info, Some(sensor), DecodeFormat::RawProxy, file_bytes, Some(&route));
+        let sensor_px = sensor.0 as usize * sensor.1 as usize;
+        let kept = fit_long_side(sensor);
+        let retained = kept.0 as usize * kept.1 as usize * RETAINED_BYTES_PER_PX * 4 / 3;
+        assert_eq!(admitted, file_bytes + retained + sensor_px * 20);
+        assert!(admitted > floor, "{admitted} should exceed the legacy estimate {floor}");
+
+        // Without a route (EIP, raster) the legacy estimate is the charge, but
+        // the sensor grid is still honoured when one is supplied.
+        assert_eq!(decode_admission_bytes(info, None, DecodeFormat::Raster, 0, None), estimated_decode_bytes(info.0, info.1, DecodeFormat::Raster));
+        assert!(decode_admission_bytes(info, Some(sensor), DecodeFormat::RawNative, 0, None) >= estimated_decode_bytes(sensor.0, sensor.1, DecodeFormat::RawNative));
+        // Never below the legacy estimate, even with a degenerate sensor answer.
+        assert!(decode_admission_bytes(info, Some((1, 1)), DecodeFormat::RawNative, 0, Some(&route)) >= estimated_decode_bytes(info.0, info.1, DecodeFormat::RawNative));
+        // Saturates instead of overflowing.
+        assert_eq!(
+            decode_admission_bytes((u32::MAX, u32::MAX), None, DecodeFormat::RawNative, usize::MAX, Some(&route)),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn raw_admission_inputs_skip_non_raw_files() {
+        let (sensor, file_bytes, route) = raw_admission_inputs(Path::new("photo.jpg"));
+        assert!(sensor.is_none() && file_bytes == 0 && route.is_none());
+    }
+
+    #[test]
     fn decode_gate_units_follow_byte_budget() {
         let mib = 1024 * 1024usize;
         assert_eq!(decode_gate_units(512 * mib), 2);
@@ -8119,6 +8364,12 @@ mod tests {
         let before = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
         engine.clear_source_cache();
         assert_eq!(engine.source_cache_stats().current_bytes, 0);
+        // The on-disk thumbnail cache is JPEG (lossy) and would answer the second
+        // call without touching the source cache; drop it so the render is redone.
+        if let Some(store) = &engine.store {
+            let rel = engine.state.lock().entries[0].rel_path.clone();
+            store.thumb_cache().invalidate(&rel);
+        }
         let after = pixel_hash(&engine.thumbnail(id, &adjustments, 128).unwrap().pixels);
         assert_eq!(before, after, "cache eviction changed the rendered pixels");
         std::fs::remove_dir_all(&dir).ok();
@@ -9320,6 +9571,55 @@ mod warmup_wiring_tests {
             rendering_intent: None,
             black_point_compensation: false,
         }
+    }
+
+    /// A stored settled frame comes back byte-identical as a progressive first
+    /// frame carrying the *requesting* generation, and only for the identical
+    /// source, adjustments and output size.
+    #[test]
+    fn disk_placeholder_returns_the_settled_frame_only_for_identical_requests() {
+        let dir = temp_dir("disk-placeholder");
+        write_png(&dir, "a.png");
+        let engine = FileEngine::open(&dir).unwrap();
+        let id = engine.images()[0].id;
+        let path = engine.image_path(id).unwrap();
+        let mut request = preview_request(id);
+        request.bypass = false;
+        request.generation = 3;
+        let rendered = engine.render_preview(&request).unwrap();
+
+        let disk = crate::preview_disk::PreviewDisk::open(dir.join("disk-cache"), 8 << 20).unwrap();
+        let adj = crate::styles::resolve(&request.adjustments);
+        let key = crate::preview_disk::DiskKey::new(
+            &path, &adj, request.region, request.max_size, request.bypass, request.mask_overlay, false,
+        )
+        .unwrap();
+        assert!(engine.renders().disk_placeholder_with(&disk, &request, &path).is_none(), "cold");
+        assert!(disk.store(&key, rendered.image.width, rendered.image.height, &rendered.image.pixels));
+
+        let mut newer = request.clone();
+        newer.generation = 9;
+        let hit = engine.renders().disk_placeholder_with(&disk, &newer, &path).expect("hit");
+        assert_eq!(hit.generation, 9, "the placeholder answers the requesting generation");
+        assert_eq!((hit.image.width, hit.image.height), (rendered.image.width, rendered.image.height));
+        assert_eq!(*hit.image.pixels, *rendered.image.pixels, "hit is the settled frame, byte for byte");
+        assert!(!hit.bgra && hit.scopes.is_none() && hit.degraded.is_none());
+        assert_eq!(hit.histogram, rendered.histogram);
+
+        // Another output size, another edit, a region or proofing: no placeholder.
+        let mut other = request.clone();
+        other.max_size = 256;
+        assert!(engine.renders().disk_placeholder_with(&disk, &other, &path).is_none());
+        let mut edited = request.clone();
+        edited.adjustments.exposure.exposure = 0.5;
+        assert!(engine.renders().disk_placeholder_with(&disk, &edited, &path).is_none());
+        let mut zoom = request.clone();
+        zoom.region = crate::NormRect { x: 0.25, y: 0.25, width: 0.5, height: 0.5 };
+        assert!(engine.renders().disk_placeholder_with(&disk, &zoom, &path).is_none());
+        let mut proof = request.clone();
+        proof.proof_profile = Some("p.icc".to_string());
+        assert!(engine.renders().disk_placeholder_with(&disk, &proof, &path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `FileEngine::open` is the real registration point: opening a library has

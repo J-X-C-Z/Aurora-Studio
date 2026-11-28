@@ -304,7 +304,7 @@ mod loader {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod loader {
     use super::*;
     use std::ffi::{CStr, c_char, c_int, c_void};
@@ -381,21 +381,6 @@ mod loader {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
-mod loader {
-    use super::*;
-
-    #[derive(Clone, Copy)]
-    pub struct HipApi {}
-
-    pub fn load() -> Result<HipApi, ComputeError> {
-        Err(ComputeError::BackendUnavailable(HIP_UNAVAILABLE))
-    }
-
-    pub fn device_name(_prop: &HipDeviceProp) -> String {
-        String::new()
-    }
-}
 
 enum HipState {
     Unavailable(&'static str),

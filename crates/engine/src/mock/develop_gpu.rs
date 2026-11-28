@@ -276,7 +276,11 @@ pub(crate) struct EditorParams {
 impl EditorParams {
     fn from_editor(ce: &ColorEditor) -> Self {
         let mut out = vec![0.0f32; E_SKIN_BASE];
-        out[E_GLOBAL_ENABLED] = if ce.global.enabled { 1.0 } else { 0.0 };
+        // Only terms that move the pixel are sent: an enabled band with a zero
+        // shift must not count towards the kernel's weight normalisation (CPU
+        // `processing::color::color_editor`).
+        let global_active = ce.global.enabled && ce.global_shift != HslShift::default();
+        out[E_GLOBAL_ENABLED] = if global_active { 1.0 } else { 0.0 };
         write_band(&mut out[E_GLOBAL_BAND..E_GLOBAL_BAND + 12], &ce.global);
         out[E_GLOBAL_SHIFT] = ce.global_shift.hue;
         out[E_GLOBAL_SHIFT + 1] = ce.global_shift.saturation;
@@ -302,12 +306,16 @@ impl EditorParams {
         for range in &ce.skin {
             let mut entry = vec![0.0f32; E_SKIN_STRIDE];
             if let Some(band) = find_band(range.id) {
-                if band.enabled {
+                if band.enabled && band.homogeneity != [0.0; 3] {
                     entry[0] = 1.0;
                     write_band(&mut entry[1..13], band);
                     entry[13..16].copy_from_slice(&band.homogeneity);
                 }
-            } else if let Some(u) = &range.uniformity {
+            } else if let Some(u) = range
+                .uniformity
+                .as_ref()
+                .filter(|u| u.hue != 0.0 || u.saturation > 0.0 || u.lightness > 0.0)
+            {
                 entry[0] = 2.0;
                 entry[16] = range.hue;
                 entry[17] = range.width;
@@ -329,6 +337,7 @@ impl EditorParams {
             .map(|r| (r, zero))
             .chain(ce.skin.iter().map(|r| (r, zero)))
             .chain(ce.max_smooth.iter().map(|r| (r, extra)))
+            .filter(|(range, _)| range.shift != HslShift::default())
         {
             let mut entry = vec![0.0f32; E_SHIFT_STRIDE];
             entry[1] = feather;
@@ -1096,7 +1105,9 @@ fn hue_distance(a: f32, b: f32) -> f32 {
     d.min(360.0 - d)
 }
 
-fn band_weight(b: &[f32], extra_feather: f32, h: f32, s: f32, v: f32) -> f32 {
+/// C1 `HueBandWeight` * `ChromaBandWeight`: there is no value selection band,
+/// so `b[7..9]` are carried but not read (CPU `processing::color::band_weight`).
+fn band_weight(b: &[f32], extra_feather: f32, h: f32, s: f32, _v: f32) -> f32 {
     let d = signed_hue_delta(h, b[0]);
     let feather = b[9].max(0.1) + extra_feather;
     let hue_w = if d < b[3] {
@@ -1115,15 +1126,7 @@ fn band_weight(b: &[f32], extra_feather: f32, h: f32, s: f32, v: f32) -> f32 {
     } else {
         1.0
     };
-    let vv = v.clamp(0.0, 1.0);
-    let value_w = if vv < b[7] {
-        sstep(b[7] - 0.05, b[7], vv)
-    } else if vv > b[8] {
-        1.0 - sstep(b[8], b[8] + 0.05, vv)
-    } else {
-        1.0
-    };
-    (hue_w * sat_w * value_w).clamp(0.0, 1.0)
+    (hue_w * sat_w).clamp(0.0, 1.0)
 }
 
 fn color_range_weight(e: &[f32], c: [f32; 3]) -> f32 {
@@ -1134,38 +1137,41 @@ fn color_range_weight(e: &[f32], c: [f32; 3]) -> f32 {
     hue_w * sstep(e[3] * 0.5, e[3] + 0.05, s)
 }
 
-fn apply_homogeneity(band: &[f32], homogeneity: &[f32], w: f32, h: &mut f32, s: &mut f32, v: &mut f32) {
-    let hue = homogeneity[0] / 100.0 * w;
-    if hue != 0.0 {
-        *h += signed_hue_delta(band[0], *h) * hue;
-    }
-    let sat = homogeneity[1] / 100.0 * w;
-    if sat != 0.0 {
-        *s += (band[1] - *s) * sat;
-    }
-    let light = homogeneity[2] / 100.0 * w;
-    if light != 0.0 {
-        *v += (band[2] - *v) * light;
-    }
+/// C1 asymmetric quadratic damping for skin lightness uniformity; mirrors
+/// `processing::color::skin_luma_uniform_step`.
+fn skin_luma_uniform_step(l_cur: f32, l_target: f32, uniformity: f32) -> f32 {
+    let lt = l_target.clamp(0.001, 99.999);
+    let q = if l_cur < lt {
+        l_cur / lt
+    } else {
+        let k = 4.0 * (0.5 * (4.0625f32.sqrt() + 0.25) - 1.0);
+        1.0 - k * (l_cur - lt) / (100.0 - lt)
+    };
+    let factor = (1.0 - 0.25 * q).powi(2);
+    let l_uniform = lt + factor * (l_cur - lt);
+    (0.01 * uniformity) * (l_uniform - l_cur)
 }
 
+/// Mirror of the CUDA `color_editor`, and of CPU
+/// `processing::color::color_editor` (C1 semantics, `k = 1`): every term reads
+/// the source HSV, the weights are normalised when they sum above one, and the
+/// host only sends terms that move the pixel.
 fn color_editor(g: [f32; 3], e: &[f32], n_skin: i32, n_shift: i32) -> [f32; 3] {
     let (h0, s0, v0) = rgb_to_hsv([g[0].max(0.0), g[1].max(0.0), g[2].max(0.0)]);
     if s0 < 0.02 {
         return g;
     }
     let extra = e[E_BASIC_EXTRA].max(0.0);
-    let mut h = h0;
-    let mut s = s0;
-    let mut v = v0;
-    let mut dh = 0.0;
-    let mut ds = 0.0;
-    let mut dl = 0.0;
+    let mut dh = 0.0f32;
+    let mut ds = 0.0f32;
+    let mut dl = 0.0f32;
+    let mut w_sum = 0.0f32;
 
     if e[E_GLOBAL_ENABLED] != 0.0 {
         let band = &e[E_GLOBAL_BAND..E_GLOBAL_BAND + 12];
         let mut w = band_weight(band, 0.0, h0, s0, v0);
         if band[10] != 0.0 { w = 1.0 - w; }
+        w_sum += w;
         dh += e[E_GLOBAL_SHIFT] * w;
         ds += e[E_GLOBAL_SHIFT + 1] * w;
         dl += e[E_GLOBAL_SHIFT + 2] * w;
@@ -1180,17 +1186,26 @@ fn color_editor(g: [f32; 3], e: &[f32], n_skin: i32, n_shift: i32) -> [f32; 3] {
             let hom = &entry[13..16];
             let mut w = band_weight(band, 0.0, h0, s0, v0);
             if band[10] != 0.0 { w = 1.0 - w; }
-            apply_homogeneity(band, hom, w, &mut h, &mut s, &mut v);
+            w_sum += w;
+            if hom[0] != 0.0 {
+                dh += signed_hue_delta(band[0], h0) * (hom[0] / 100.0 * w);
+            }
+            if hom[1] != 0.0 {
+                ds += (band[1] - s0) * hom[1] * w;
+            }
+            if hom[2] != 0.0 {
+                dl += skin_luma_uniform_step(v0 * 100.0, band[2] * 100.0, hom[2]) * w;
+            }
         } else if mode == 2 {
             let w = color_range_weight(&entry[16..20], g);
-            h += signed_hue_delta(entry[16], h) * (entry[20] / 100.0 * w);
+            w_sum += w;
+            dh += signed_hue_delta(entry[16], h0) * (entry[20] / 100.0 * w);
             if entry[21] > 0.0 {
                 let target_s = (entry[19] + 0.35).clamp(0.15, 0.55);
-                s += (target_s - s) * (entry[21] / 100.0 * w);
+                ds += (target_s - s0) * entry[21] * w;
             }
             if entry[22] > 0.0 {
-                let target_v = 0.65;
-                v += (target_v - v) * (entry[22] / 100.0 * w * 0.5);
+                dl += skin_luma_uniform_step(v0 * 100.0, 65.0, entry[22]) * w;
             }
         }
     }
@@ -1202,8 +1217,9 @@ fn color_editor(g: [f32; 3], e: &[f32], n_skin: i32, n_shift: i32) -> [f32; 3] {
             continue;
         }
         let band = &entry[0..12];
-        let mut w = band_weight(band, extra, h, s, v);
+        let mut w = band_weight(band, extra, h0, s0, v0);
         if band[10] != 0.0 { w = 1.0 - w; }
+        w_sum += w;
         dh += entry[12] * w;
         ds += entry[13] * w;
         dl += entry[14] * w;
@@ -1214,10 +1230,10 @@ fn color_editor(g: [f32; 3], e: &[f32], n_skin: i32, n_shift: i32) -> [f32; 3] {
         let at = shift_base + i * E_SHIFT_STRIDE;
         let entry = &e[at..at + E_SHIFT_STRIDE];
         let mode = entry[0] as i32;
-        if mode == 1 {
-            continue;
-        }
-        let w = if mode == 0 {
+        // A disabled band keeps its shift but covers nothing (weight 0).
+        let w = if mode == 1 {
+            0.0
+        } else if mode == 0 {
             let band = &entry[2..14];
             let mut w = band_weight(band, entry[1], h0, s0, v0);
             if band[10] != 0.0 { w = 1.0 - w; }
@@ -1225,17 +1241,24 @@ fn color_editor(g: [f32; 3], e: &[f32], n_skin: i32, n_shift: i32) -> [f32; 3] {
         } else {
             color_range_weight(&entry[17..21], g)
         };
+        w_sum += w;
         dh += entry[14] * w;
         ds += entry[15] * w;
         dl += entry[16] * w;
     }
 
+    if w_sum > 1.0 {
+        let inv = 1.0 / w_sum;
+        dh *= inv;
+        ds *= inv;
+        dl *= inv;
+    }
     let dh = dh.clamp(-180.0, 180.0);
     let ds = ds.clamp(-100.0, 100.0);
     let dl = dl.clamp(-100.0, 100.0);
-    let s2 = (s * (1.0 + ds / 100.0)).clamp(0.0, 1.0);
-    let v2 = (v * (1.0 + dl / 100.0 * 0.5 * s)).max(0.0);
-    hsv_to_rgb(h + dh, s2, v2)
+    let s2 = (s0 * (1.0 + ds / 100.0)).clamp(0.0, 1.0);
+    let v2 = (v0 * (1.0 + dl / 100.0 * 0.5 * s0)).max(0.0);
+    hsv_to_rgb(h0 + dh, s2, v2)
 }
 
 fn output_banding(p: &DevelopParams, rgb: [f32; 3], f: [f32; 2]) -> [f32; 3] {
@@ -2483,6 +2506,100 @@ pub(crate) fn resident_crossover_admits(width: usize, height: usize) -> bool {
     (width as u64).saturating_mul(height as u64) >= floor
 }
 
+/// Device bytes one resident preview frame asks the pool for, per buffer.
+/// Shared by [`render_resident_preview`] and [`resident_preview_admits`] so the
+/// non-allocating preflight and the real `ensure` can never disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResidentNeeds {
+    pub src: usize,
+    pub rgb3: usize,
+    pub usm_cam: usize,
+    pub usm_planes: usize,
+    pub out_u8: usize,
+    pub gain: usize,
+    pub editor: usize,
+}
+
+impl ResidentNeeds {
+    pub(crate) fn of(
+        pixels: usize,
+        params: &DevelopParams,
+        has_gain: bool,
+        camera_usm: bool,
+        display_usm: bool,
+        has_nr: bool,
+        has_single_pixel: bool,
+    ) -> Option<Self> {
+        let needs_rgb3 = camera_usm || display_usm || has_nr || has_single_pixel;
+        Some(Self {
+            src: pixels.checked_mul(16)?,
+            rgb3: if needs_rgb3 { pixels.checked_mul(12)? } else { 0 },
+            usm_cam: if camera_usm { pixels.checked_mul(16)? } else { 0 },
+            usm_planes: if camera_usm || display_usm {
+                pixels.checked_mul(12)?
+            } else if has_single_pixel {
+                pixels.checked_mul(4)?
+            } else {
+                0
+            },
+            out_u8: pixels.checked_mul(4)?,
+            gain: if has_gain { pixels.checked_mul(4)? } else { 0 },
+            editor: params
+                .editor
+                .as_ref()
+                .map(|e| e.floats.len().saturating_mul(4))
+                .unwrap_or(0)
+                .max(E_SKIN_BASE * 4),
+        })
+    }
+
+    /// Lease bytes the pool would hold: fixed tables plus every buffer, with the
+    /// gain plane counted twice (device buffer and page-locked staging).
+    pub(crate) fn lease_bytes(&self) -> usize {
+        ResidentPool::fixed_resident_bytes()
+            .saturating_add(self.src)
+            .saturating_add(self.rgb3)
+            .saturating_add(self.usm_cam)
+            .saturating_add(self.usm_planes)
+            .saturating_add(self.out_u8)
+            .saturating_add(self.gain.saturating_mul(2))
+            .saturating_add(self.editor)
+    }
+}
+
+/// Non-allocating admission for the resident preview path. Callers run this
+/// before building the full-frame gain plane and the sample array, so a frame
+/// the shared VRAM ledger would refuse never materializes them. `true` only says
+/// the ledger would admit the lease; `render_resident_preview` still decides.
+pub(crate) fn resident_preview_admits(
+    width: usize,
+    height: usize,
+    params: &DevelopParams,
+    has_gain: bool,
+    camera_usm: bool,
+    display_usm: bool,
+    nr: Option<&NoiseReduction>,
+) -> bool {
+    if !enabled() || !resident_crossover_admits(width, height) {
+        return false;
+    }
+    let Some(pixels) = width.checked_mul(height).filter(|p| *p > 0) else { return false };
+    let has_single_pixel = nr.is_some_and(|n| n.single_pixel > 0.0);
+    let has_nr = nr.is_some_and(|n| n.luminance > 0.0 || n.color > 0.0);
+    if has_nr && !super::nr_gpu::enabled() {
+        return false;
+    }
+    let Some(needs) = ResidentNeeds::of(pixels, params, has_gain, camera_usm, display_usm, has_nr, has_single_pixel)
+    else {
+        return false;
+    };
+    let total = needs.lease_bytes();
+    if total > develop_budget() {
+        return false;
+    }
+    gpu_runtime::vram_can_allocate("develop_resident", total)
+}
+
 struct ResidentPool {
     // Device buffers and stream are declared BEFORE `lease` so Drop releases
     // VRAM before returning budget credit to the shared VramLedger.
@@ -2860,24 +2977,23 @@ where
         return None;
     }
     let needs_rgb3 = camera_usm.is_some() || display_usm.is_some() || has_nr || has_single_pixel;
-    let need_src = pixels.checked_mul(16)?;
-    let need_rgb3 = if needs_rgb3 { pixels.checked_mul(12)? } else { 0 };
-    let need_usm_cam = if camera_usm.is_some() { pixels.checked_mul(16)? } else { 0 };
-    let need_usm_planes = if camera_usm.is_some() || display_usm.is_some() {
-        pixels.checked_mul(12)?
-    } else if has_single_pixel {
-        pixels.checked_mul(4)?
-    } else {
-        0
-    };
-    let need_out_u8 = pixels.checked_mul(4)?;
-    let need_gain = if gain_plane.is_some() { pixels.checked_mul(4)? } else { 0 };
-    let need_editor = params
-        .editor
-        .as_ref()
-        .map(|e| e.floats.len().saturating_mul(4))
-        .unwrap_or(0)
-        .max(E_SKIN_BASE * 4);
+    let ResidentNeeds {
+        src: need_src,
+        rgb3: need_rgb3,
+        usm_cam: need_usm_cam,
+        usm_planes: need_usm_planes,
+        out_u8: need_out_u8,
+        gain: need_gain,
+        editor: need_editor,
+    } = ResidentNeeds::of(
+        pixels,
+        params,
+        gain_plane.is_some(),
+        camera_usm.is_some(),
+        display_usm.is_some(),
+        has_nr,
+        has_single_pixel,
+    )?;
 
     register_resident_reclaimer();
     let mut lock = resident_state().lock().unwrap_or_else(|e| e.into_inner());
@@ -3387,6 +3503,44 @@ mod tests {
 
     fn code8(v: f32) -> i32 {
         (v.clamp(0.0, 1.0) * 255.0 + 0.5) as i32
+    }
+
+    #[test]
+    fn resident_needs_match_the_pool_buffer_formulas() {
+        let params = DevelopParams::from_adjustments(&AdjustmentSet::default(), [1.0; 3], 1.0, false);
+        let px = 1920usize * 1080;
+        let plain = ResidentNeeds::of(px, &params, false, false, false, false, false).unwrap();
+        assert_eq!(plain.src, px * 16);
+        assert_eq!((plain.rgb3, plain.usm_cam, plain.usm_planes, plain.gain), (0, 0, 0, 0));
+        assert_eq!(plain.out_u8, px * 4);
+        assert!(plain.editor >= E_SKIN_BASE * 4);
+
+        let full = ResidentNeeds::of(px, &params, true, true, false, true, false).unwrap();
+        assert_eq!((full.rgb3, full.usm_cam, full.usm_planes, full.gain), (px * 12, px * 16, px * 12, px * 4));
+        // Single-pixel NR alone needs the rgb3 work frame and a 4 B/px plane.
+        let single = ResidentNeeds::of(px, &params, false, false, false, false, true).unwrap();
+        assert_eq!((single.rgb3, single.usm_planes), (px * 12, px * 4));
+
+        // The gain plane is counted twice (device + page-locked staging).
+        assert_eq!(
+            full.lease_bytes() - plain.lease_bytes(),
+            (full.rgb3 + full.usm_cam + full.usm_planes) + full.gain * 2
+        );
+        // Overflow is refused, not wrapped.
+        assert!(ResidentNeeds::of(usize::MAX / 8, &params, false, false, false, false, false).is_none());
+    }
+
+    #[test]
+    fn resident_preview_admits_refuses_without_a_device_or_below_crossover() {
+        let params = DevelopParams::from_adjustments(&AdjustmentSet::default(), [1.0; 3], 1.0, false);
+        // Below the resident crossover floor: never admitted, nothing allocated.
+        assert!(!resident_preview_admits(64, 64, &params, false, false, false, None));
+        // Zero-sized frames are refused.
+        assert!(!resident_preview_admits(0, 1080, &params, false, false, false, None));
+        // Without a CUDA backend (non-Windows default) nothing is admitted.
+        if !enabled() {
+            assert!(!resident_preview_admits(1920, 1080, &params, true, true, true, None));
+        }
     }
 
     // ── staged transfer counters (pure arithmetic; no CUDA device) ────────
